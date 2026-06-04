@@ -1,0 +1,9 @@
+storage:
+  storage_path: /qdrant/storage
+  snapshots_path: /qdrant/snapshots
+
+service:
+  max_request_size_mb: 256
+  max_workers: 0  # auto
+
+log_level: INFO

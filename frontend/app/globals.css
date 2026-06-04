@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 45 89% 48%;          /* Legal gold */
+    --primary-foreground: 0 0% 0%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 45 89% 48%;
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 224 15% 5%;       /* Near black */
+    --foreground: 210 20% 92%;
+    --card: 224 15% 8%;
+    --card-foreground: 210 20% 92%;
+    --popover: 224 15% 8%;
+    --popover-foreground: 210 20% 92%;
+    --primary: 45 89% 48%;          /* Gold accent */
+    --primary-foreground: 0 0% 0%;
+    --secondary: 224 15% 12%;
+    --secondary-foreground: 210 20% 88%;
+    --muted: 224 15% 12%;
+    --muted-foreground: 210 10% 55%;
+    --accent: 224 15% 14%;
+    --accent-foreground: 210 20% 88%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 224 15% 15%;
+    --input: 224 15% 12%;
+    --ring: 45 89% 48%;
+  }
+}
+
+@layer base {
+  * { @apply border-border; }
+  body { @apply bg-background text-foreground; }
+}
+
+/* Legal document typography */
+.legal-prose {
+  @apply text-sm leading-relaxed text-foreground/90;
+  font-family: 'Georgia', 'Times New Roman', serif;
+}
+
+/* Citation cards */
+.citation-card {
+  @apply rounded border border-primary/20 bg-primary/5 px-3 py-2 text-xs;
+}
+
+/* Confidence badge */
+.confidence-high { @apply text-emerald-400; }
+.confidence-medium { @apply text-amber-400; }
+.confidence-low { @apply text-red-400; }
+
+/* Streaming cursor */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.streaming-cursor::after {
+  content: '▊';
+  @apply text-primary;
+  animation: blink 1s step-end infinite;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: hsl(var(--background)); }
+::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground)); }
+
+/* Mark highlight (BM25 snippets) */
+mark {
+  @apply bg-primary/20 text-primary rounded-sm px-0.5;
+}

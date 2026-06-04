@@ -1,0 +1,58 @@
+[
+  {
+    "query": "What is cheating under BNS?",
+    "expected_law": "BNS",
+    "expected_sections": ["318"],
+    "expected_intent": "provision_lookup",
+    "min_confidence": 0.7
+  },
+  {
+    "query": "Anticipatory bail provisions under new criminal law",
+    "expected_law": "BNSS",
+    "expected_sections": ["482"],
+    "expected_intent": "provision_lookup",
+    "min_confidence": 0.65
+  },
+  {
+    "query": "How is electronic evidence admitted in court?",
+    "expected_law": "BSA",
+    "expected_sections": ["63"],
+    "expected_intent": "provision_lookup",
+    "min_confidence": 0.65
+  },
+  {
+    "query": "Quashing of FIR by High Court",
+    "expected_law": null,
+    "expected_sections": [],
+    "expected_intent": "case_search",
+    "min_confidence": 0.5
+  },
+  {
+    "query": "Punishment for murder under Bharatiya Nyaya Sanhita",
+    "expected_law": "BNS",
+    "expected_sections": ["101", "103"],
+    "expected_intent": "provision_lookup",
+    "min_confidence": 0.7
+  },
+  {
+    "query": "Draft anticipatory bail application for accused in financial fraud case",
+    "expected_law": "BNSS",
+    "expected_sections": ["482"],
+    "expected_intent": "drafting_request",
+    "min_confidence": 0.6
+  },
+  {
+    "query": "Section 406 IPC equivalent in BNS",
+    "expected_law": "BNS",
+    "expected_sections": ["316"],
+    "expected_intent": "provision_lookup",
+    "min_confidence": 0.6
+  },
+  {
+    "query": "Bail conditions for non-bailable offence",
+    "expected_law": "BNSS",
+    "expected_sections": ["480", "481"],
+    "expected_intent": "procedure_query",
+    "min_confidence": 0.6
+  }
+]
