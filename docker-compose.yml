@@ -39,7 +39,8 @@ services:
     environment:
       QDRANT__SERVICE__HTTP_PORT: 6333
       QDRANT__SERVICE__GRPC_PORT: 6334
-    # qdrant image has wget built-in, not curl
+    # No healthcheck — qdrant v1.7.4 image is minimal, healthcheck causes false failures.
+    # Backend handles Qdrant not-yet-ready gracefully in lifespan startup.
 
 
   # ── Redis ────────────────────────────────────────────────────────────────
@@ -78,6 +79,7 @@ services:
       QDRANT_PORT: 6333
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      HF_HOME: /app/data/embeddings/models
     ports:
       - "8000:8000"
     volumes:
@@ -106,7 +108,8 @@ services:
     container_name: nyaya_frontend
     restart: unless-stopped
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+      # Empty string means relative URLs — nginx proxies /api/* to backend
+      NEXT_PUBLIC_API_URL: ""
     ports:
       - "3000:3000"
     # Don't wait for backend healthy — frontend is static, just needs to start

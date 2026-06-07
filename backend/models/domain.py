@@ -309,6 +309,12 @@ class UploadResponse(BaseModel):
 # User & Auth Models
 # ─────────────────────────────────────────────
 
+class UserLogin(BaseModel):
+    """Minimal model for login — only email + password required."""
+    email: str
+    password: str
+
+
 class UserCreate(BaseModel):
     email: str
     password: str = Field(..., min_length=8)

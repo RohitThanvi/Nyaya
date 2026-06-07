@@ -17,6 +17,7 @@ async def list_documents(
     law: str = Query(None),
     court: str = Query(None),
     year: int = Query(None),
+    document_type: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -34,6 +35,9 @@ async def list_documents(
     if year:
         conditions.append("year = :year")
         params["year"] = year
+    if document_type:
+        conditions.append("document_type = :document_type")
+        params["document_type"] = document_type
 
     where = " AND ".join(conditions)
     result = await db.execute(

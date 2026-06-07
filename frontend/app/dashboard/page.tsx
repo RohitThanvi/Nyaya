@@ -2,8 +2,16 @@
 
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
-import { Scale, Search, MessageSquare, FileUp, FileText, PenTool, Activity, ChevronRight, BookOpen, Gavel, Shield } from 'lucide-react'
-import { healthApi } from '@/lib/api'
+import { useRouter } from 'next/navigation'
+import {
+  Scale, Search, MessageSquare, FileUp, FileText, PenTool,
+  Activity, ChevronRight, BookOpen, Gavel, Shield, LogOut,
+  Moon, Sun, User, Cpu, GitBranch, Database, Zap
+} from 'lucide-react'
+import { useTheme } from 'next-themes'
+import { healthApi, authApi } from '@/lib/api'
+import { useAuthStore } from '@/lib/store'
+import { toast } from 'sonner'
 
 const NAV_ITEMS = [
   { href: '/search', icon: Search, label: 'Legal Search', desc: 'BNS/BNSS/BSA + judgment retrieval', color: 'text-blue-400' },
@@ -13,18 +21,32 @@ const NAV_ITEMS = [
   { href: '/drafting', icon: PenTool, label: 'Draft Documents', desc: 'Bail, notices, affidavits', color: 'text-rose-400' },
 ]
 
-const LAW_STATS = [
-  { label: 'BNS Sections', value: '358', icon: BookOpen },
-  { label: 'BNSS Sections', value: '531', icon: Gavel },
-  { label: 'BSA Sections', value: '170', icon: Shield },
+const AGENTS = [
+  { icon: Search, label: 'Query Understanding', desc: 'Classifies intent, maps to BNS/BNSS/BSA provisions' },
+  { icon: Database, label: 'Hybrid Retrieval', desc: 'BM25 + ANN vector search with RRF fusion' },
+  { icon: Zap, label: 'Cross-Encoder Reranker', desc: 'ms-marco MiniLM re-scores candidate chunks' },
+  { icon: Cpu, label: 'Hallucination Verifier', desc: 'Validates every claim against retrieved context' },
+  { icon: GitBranch, label: 'Legal Mapper', desc: 'Maps queries to specific statutory provisions' },
+  { icon: FileText, label: 'Summarization Agent', desc: 'Produces structured summaries with citations' },
+  { icon: PenTool, label: 'Drafting Agent', desc: '8 document templates: bail, FIR, notices, affidavits' },
 ]
 
 export default function DashboardPage() {
   const [health, setHealth] = useState<Record<string, any> | null>(null)
+  const { user, clearUser, isAuthenticated } = useAuthStore()
+  const { theme, setTheme } = useTheme()
+  const router = useRouter()
 
   useEffect(() => {
     healthApi.check().then(setHealth).catch(() => {})
   }, [])
+
+  const handleLogout = () => {
+    authApi.logout()
+    clearUser()
+    toast.success('Signed out')
+    router.push('/auth/login')
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -38,17 +60,36 @@ export default function DashboardPage() {
             <span className="font-semibold text-lg tracking-tight">NyayaAI</span>
             <span className="text-xs text-muted-foreground border border-border rounded px-1.5 py-0.5">BETA</span>
           </div>
-          <nav className="flex items-center gap-6">
+          <nav className="flex items-center gap-4">
             {NAV_ITEMS.slice(0, 3).map((item) => (
               <Link key={item.href} href={item.href}
-                className="text-sm text-muted-foreground hover:text-foreground transition-colors">
+                className="text-sm text-muted-foreground hover:text-foreground transition-colors hidden md:block">
                 {item.label}
               </Link>
             ))}
-            <Link href="/auth/login"
-              className="text-sm bg-primary text-primary-foreground px-3 py-1.5 rounded-md font-medium hover:bg-primary/90 transition-colors">
-              Sign In
-            </Link>
+            <button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              className="text-muted-foreground hover:text-foreground transition-colors p-1">
+              {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+            </button>
+            {isAuthenticated && user ? (
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-2 bg-card border border-border rounded-lg px-3 py-1.5">
+                  <User className="w-3.5 h-3.5 text-primary" />
+                  <span className="text-sm font-medium">{user.full_name}</span>
+                  <span className="text-xs text-muted-foreground capitalize border border-border rounded px-1.5 py-0.5">{user.role}</span>
+                </div>
+                <button onClick={handleLogout}
+                  className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors">
+                  <LogOut className="w-3.5 h-3.5" />
+                  Sign out
+                </button>
+              </div>
+            ) : (
+              <Link href="/auth/login"
+                className="text-sm bg-primary text-primary-foreground px-3 py-1.5 rounded-md font-medium hover:bg-primary/90 transition-colors">
+                Sign In
+              </Link>
+            )}
           </nav>
         </div>
       </header>
@@ -61,8 +102,8 @@ export default function DashboardPage() {
             BNS · BNSS · BSA · Supreme Court Judgments
           </div>
           <h1 className="text-5xl font-bold tracking-tight mb-4">
-            Indian Legal Research,{' '}
-            <span className="text-primary">Reimagined</span>
+            {user ? `Welcome back, ${user.full_name.split(' ')[0]}` : 'Indian Legal Research,'}{' '}
+            {!user && <span className="text-primary">Reimagined</span>}
           </h1>
           <p className="text-xl text-muted-foreground max-w-2xl mx-auto mb-8">
             Hybrid BM25 + semantic retrieval over Bharatiya codes and Supreme Court judgments.
@@ -80,17 +121,6 @@ export default function DashboardPage() {
               Ask a Question
             </Link>
           </div>
-        </div>
-
-        {/* Law Stats */}
-        <div className="grid grid-cols-3 gap-4 mb-12">
-          {LAW_STATS.map(({ label, value, icon: Icon }) => (
-            <div key={label} className="bg-card border border-border rounded-xl p-6 text-center">
-              <Icon className="w-5 h-5 text-primary mx-auto mb-2" />
-              <div className="text-3xl font-bold text-foreground">{value}</div>
-              <div className="text-sm text-muted-foreground">{label}</div>
-            </div>
-          ))}
         </div>
 
         {/* Feature Grid */}
@@ -123,18 +153,43 @@ export default function DashboardPage() {
                   <div key={name} className="flex items-center justify-between text-xs">
                     <span className="text-muted-foreground capitalize">{name}</span>
                     <span className={info.status === 'ok' ? 'text-emerald-400' : 'text-amber-400'}>
-                      {info.status === 'ok' ? `●  ${info.latency_ms}ms` : '○  degraded'}
+                      {info.status === 'ok' ? `● ${info.latency_ms}ms` : '○ degraded'}
                     </span>
                   </div>
                 ))}
               </div>
             ) : (
-              <p className="text-xs text-muted-foreground">Checking...</p>
+              <p className="text-xs text-muted-foreground">Checking…</p>
             )}
           </div>
         </div>
 
-        {/* Legal disclaimer */}
+        {/* AI Agent Pipeline */}
+        <div className="mb-12">
+          <div className="flex items-center gap-3 mb-6">
+            <Cpu className="w-5 h-5 text-primary" />
+            <h2 className="text-lg font-semibold">AI Agent Pipeline</h2>
+            <span className="text-xs text-muted-foreground bg-primary/5 border border-primary/20 rounded px-2 py-0.5">
+              Deterministic · No LangGraph · FastAPI native
+            </span>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
+            {AGENTS.map(({ icon: Icon, label, desc }, i) => (
+              <div key={label} className="relative bg-card border border-border rounded-xl p-4 hover:border-primary/30 transition-all group">
+                {i < AGENTS.length - 1 && (
+                  <div className="hidden lg:block absolute -right-3 top-1/2 -translate-y-1/2 z-10 w-6 h-0.5 bg-primary/30" />
+                )}
+                <div className="w-8 h-8 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center mb-3">
+                  <Icon className="w-4 h-4 text-primary" />
+                </div>
+                <p className="text-xs font-medium leading-snug mb-1">{label}</p>
+                <p className="text-xs text-muted-foreground leading-snug hidden group-hover:block">{desc}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Disclaimer */}
         <div className="text-center text-xs text-muted-foreground border border-border/50 rounded-lg p-4 bg-card/30">
           <strong>Disclaimer:</strong> NyayaAI is a research tool and does not constitute legal advice.
           Always verify citations with official sources. Consult a qualified advocate for legal counsel.

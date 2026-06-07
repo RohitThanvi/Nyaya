@@ -18,15 +18,25 @@ def _get_model():
     """Lazy-load the embedding model (singleton)."""
     global _model_instance
     if _model_instance is None:
+        import os
         from sentence_transformers import SentenceTransformer
         from backend.config.settings import get_settings
         settings = get_settings()
         emb = settings.embedding
         logger.info(f"Loading embedding model: {emb.model}")
+
+        # Use HF_HOME if set (docker-compose mount), otherwise fall back to cache_dir.
+        # Always clear offline flags so the model can download if not cached.
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+
+        hf_home = os.environ.get("HF_HOME")
+        cache = os.path.join(hf_home, "hub") if hf_home else emb.cache_dir
+
         _model_instance = SentenceTransformer(
             emb.model,
             device=emb.device,
-            cache_folder=emb.cache_dir,
+            cache_folder=cache,
         )
         logger.info("Embedding model loaded")
     return _model_instance
@@ -123,3 +133,13 @@ class EmbeddingService:
             if i + batch_size < len(texts):
                 await asyncio.sleep(0)  # yield control
         return all_embeddings
+
+    async def initialize(self) -> None:
+        """Pre-warm the embedding model. Safe to call multiple times."""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _get_model)
+        logger.info("EmbeddingService: model ready")
+
+    async def embed(self, texts: List[str]) -> List[List[float]]:
+        """Embed a list of texts as passages (no query prefix). Alias for embed_passages_batched."""
+        return await self.embed_passages_batched(texts)

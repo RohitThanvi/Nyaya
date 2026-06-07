@@ -216,7 +216,7 @@ class HybridRetriever:
             results, timings = await self.retrieve(
                 query=q,
                 query_understanding=query_understanding,
-                top_k_final=settings.hybrid_top_k,
+                top_k_final=top_k_final,
             )
             all_results.append(results)
             for k, v in timings.items():

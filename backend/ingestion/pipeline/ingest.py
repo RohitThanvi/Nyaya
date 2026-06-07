@@ -174,9 +174,13 @@ class IngestionPipeline:
 
         chunks = self._chunker.chunk(raw_text, metadata, structure_hints)
 
-        async with get_db_session() as db:
-            await self._save_document(db, metadata, raw_text, pages, len(chunks))
-            await self._save_chunks_to_pg(db, chunks)
+        try:
+            async with get_db_session() as db:
+                await self._save_document(db, metadata, raw_text, pages, len(chunks))
+                await self._save_chunks_to_pg(db, chunks)
+                await db.commit()
+        except Exception:
+            raise
 
         chunks_created = await self._embed_and_index(chunks)
         return metadata.document_id, pages, chunks_created

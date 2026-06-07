@@ -20,13 +20,16 @@ _reranker_instance = None
 def _get_reranker():
     global _reranker_instance
     if _reranker_instance is None:
+        import os
         from sentence_transformers import CrossEncoder
         settings = get_settings().reranker
         logger.info(f"Loading reranker: {settings.model}")
+        # CrossEncoder doesn't accept cache_folder — set HF_HOME instead
+        if settings.cache_dir:
+            os.environ.setdefault("HF_HOME", settings.cache_dir)
         _reranker_instance = CrossEncoder(
             settings.model,
             device=settings.device,
-            cache_folder=settings.cache_dir,
             max_length=512,
         )
         logger.info("Reranker loaded")

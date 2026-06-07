@@ -210,6 +210,167 @@ It is therefore most humbly prayed that:
                                                   Signature: ________________
 Date: {date}
 Place: {location}""",
+
+    DraftType.FIR_QUASHING_PETITION: """IN THE HON'BLE HIGH COURT OF {state}
+AT {location}
+
+CRIMINAL MISC. PETITION NO. _____ OF {year}
+
+UNDER SECTION 528 BNSS (Formerly Section 482 CrPC)
+
+IN THE MATTER OF:
+{petitioner_name}                                 ... PETITIONER
+
+VERSUS
+
+STATE OF {state} & ANR.                           ... RESPONDENTS
+
+PETITION FOR QUASHING OF FIR NO. {fir_number}
+DATED {fir_date}, {police_station} POLICE STATION
+
+MOST RESPECTFULLY SHOWETH:
+
+1. BRIEF FACTS:
+{facts_section}
+
+2. DETAILS OF IMPUGNED FIR:
+   FIR No.:          {fir_number}
+   Date of FIR:      {fir_date}
+   Police Station:   {police_station}
+   Sections Invoked: {fir_sections}
+   Complainant:      {complainant_name}
+
+3. GROUNDS FOR QUASHING:
+{grounds_section}
+
+4. RELEVANT LEGAL PROVISIONS:
+{legal_provisions_section}
+
+5. PRECEDENTS SUPPORTING QUASHING:
+{precedents_section}
+
+6. BALANCE OF CONVENIENCE:
+{balance_section}
+
+PRAYER:
+It is therefore most respectfully prayed that this Hon'ble Court may be pleased to:
+(a) Quash and set aside FIR No. {fir_number} dated {fir_date} registered at {police_station};
+(b) Stay all proceedings arising out of the said FIR pending disposal of this petition;
+(c) Pass any other order(s) as this Hon'ble Court may deem just and proper.
+
+                                                  Respectfully submitted,
+Date: {date}
+Place: {location}
+                                                  Counsel for Petitioner
+                                                  Enrolment No.: ____________""",
+
+    DraftType.WRITTEN_STATEMENT: """{court_header}
+CASE NO. {case_number} OF {year}
+
+{plaintiff_name}                                  ... PLAINTIFF
+
+VERSUS
+
+{defendant_name}                                  ... DEFENDANT
+
+WRITTEN STATEMENT ON BEHALF OF THE DEFENDANT
+UNDER ORDER VIII RULE 1, CODE OF CIVIL PROCEDURE 1908
+
+MOST RESPECTFULLY SHOWETH:
+
+PRELIMINARY OBJECTIONS:
+{preliminary_objections}
+
+REPLY ON MERITS:
+
+Re: Paragraph 1 of the Plaint:
+{reply_para_1}
+
+Re: Paragraph 2 of the Plaint:
+{reply_para_2}
+
+Re: Paragraph 3 of the Plaint:
+{reply_para_3}
+
+{additional_replies}
+
+ADDITIONAL PLEAS:
+{additional_pleas}
+
+RELEVANT LEGAL PROVISIONS:
+{legal_provisions_section}
+
+RELIEF:
+In view of the above, the Defendant most respectfully prays that this Hon'ble Court be pleased to:
+(a) Dismiss the suit with costs;
+{additional_prayers}
+
+                                                  Respectfully submitted,
+Date: {date}
+Place: {location}
+                                                  Advocate for Defendant
+                                                  Enrolment No.: ____________
+
+VERIFICATION:
+I, {defendant_name}, the Defendant above-named, do hereby verify that the contents of paragraphs
+1 to ___ above are true and correct to my knowledge and belief, and nothing material has been
+concealed therefrom.
+
+Verified at {location} on {date}.
+                                                  Defendant""",
+
+    DraftType.VAKALATNAMA: """VAKALATNAMA
+
+IN THE {court}
+AT {location}
+
+Case/Matter: {case_title}
+Case No.: {case_number}
+
+I/We, {client_name}, {client_description}, do hereby appoint, retain and authorise:
+
+{advocate_name}
+Advocate, Bar Council of {state}
+Enrolment No.: {enrolment_number}
+Address: {advocate_address}
+
+(hereinafter referred to as "the Advocate") to act, appear and plead for me/us in the
+above-mentioned matter/case and on my/our behalf to:
+
+1. To act, appear and plead in the above Court or any other Court in which the said matter
+   may be tried or heard;
+2. To file and obtain return of documents;
+3. To sign and verify pleadings, applications, affidavits and other documents;
+4. To engage and instruct any other Advocate on my/our behalf;
+5. To do all other acts and things which may be necessary and proper for the
+   conduct of the said matter;
+6. To receive notices, orders, summons and other processes on my/our behalf;
+7. To compromise, withdraw or settle the said matter on such terms as the Advocate
+   may deem fit, PROVIDED THAT prior written consent of the client shall be obtained.
+
+I/We undertake to ratify and confirm whatever the said Advocate shall lawfully do in the
+said matter by virtue of this Vakalatnama.
+
+I/We also undertake to pay the professional fees and all other expenses as agreed.
+
+Client Details:
+Name:    {client_name}
+Address: {client_address}
+Contact: {client_contact}
+
+                    Signature of Client(s)
+
+1. ________________________         2. ________________________
+   Name:                                Name:
+   Date:                                Date:
+
+ACCEPTANCE BY ADVOCATE:
+I, {advocate_name}, Advocate, do hereby accept the above Vakalatnama.
+
+________________________
+Advocate
+Date: {date}
+Place: {location}""",
 }
 
 DRAFTING_SYSTEM = """You are an expert Indian legal drafter specializing in criminal law.

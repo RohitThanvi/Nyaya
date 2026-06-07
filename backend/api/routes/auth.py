@@ -11,7 +11,7 @@ from backend.api.dependencies.auth import (
     get_current_active_user, hash_password, verify_password
 )
 from backend.db.session import get_db
-from backend.models.domain import TokenResponse, UserCreate, UserInDB, UserRole
+from backend.models.domain import TokenResponse, UserCreate, UserInDB, UserLogin, UserRole
 
 router = APIRouter()
 
@@ -56,7 +56,7 @@ async def register(body: UserCreate, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(body: UserCreate, db: AsyncSession = Depends(get_db)):
+async def login(body: UserLogin, db: AsyncSession = Depends(get_db)):
     """Authenticate user and return tokens."""
     result = await db.execute(
         text("SELECT * FROM users WHERE email = :email AND is_active = true"),
