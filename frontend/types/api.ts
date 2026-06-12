@@ -81,6 +81,7 @@ export interface ChatRequest {
   message: string
   history: ChatMessage[]
   law_filter?: LawCategory[]
+  document_id?: string
   stream?: boolean
 }
 

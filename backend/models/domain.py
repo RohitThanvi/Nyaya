@@ -243,6 +243,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=3, max_length=5000)
     history: List[ChatMessage] = Field(default_factory=list, max_length=20)
     law_filter: Optional[List[LawCategory]] = None
+    document_id: Optional[str] = None  # scope retrieval to a specific document
     stream: bool = Field(default=True)
 
 

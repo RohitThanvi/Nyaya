@@ -44,6 +44,7 @@ async def chat(
         history=body.history,
         user_id=str(current_user.user_id),
         law_filter=body.law_filter,
+        document_id=body.document_id,
     )
     await _persist_message(db, body, response, current_user)
     return response
@@ -70,6 +71,7 @@ async def chat_stream(
                 history=body.history,
                 user_id=str(current_user.user_id),
                 law_filter=body.law_filter,
+                document_id=body.document_id,
             ):
                 # Escape newlines in token for SSE format
                 safe_token = token.replace("\n", "\\n")

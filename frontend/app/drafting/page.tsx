@@ -17,10 +17,46 @@ const DRAFT_TYPES: { value: DraftType; label: string; desc: string }[] = [
   { value: 'vakalatnama', label: 'Vakalatnama', desc: 'Authority to represent' },
 ]
 
-function ConfidenceBadge({ score }: { score: number }) {
+function ConfidenceBadge({ score, notes }: { score: number; notes?: string[] }) {
   const pct = Math.round(score * 100)
-  if (pct >= 70) return <span className="text-xs text-emerald-400 flex items-center gap-1"><CheckCircle2 className="w-3 h-3" />{pct}% quality</span>
-  return <span className="text-xs text-amber-400 flex items-center gap-1"><AlertTriangle className="w-3 h-3" />{pct}% — review carefully</span>
+  const [open, setOpen] = useState(false)
+
+  const reasons: string[] = []
+  if (pct < 100) {
+    if (pct < 50) reasons.push('Insufficient facts provided — add more case-specific details')
+    if (pct < 70) reasons.push('Some placeholders may need manual completion')
+    if (notes?.some(n => n.includes('VERIFY'))) reasons.push('Some citations need advocate verification')
+    if (notes?.some(n => n.includes('fill'))) reasons.push('Template fields may need manual input')
+    if (reasons.length === 0) reasons.push('Score reflects completeness of provided facts and available legal context')
+  }
+
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen(!open)}
+        className={`flex items-center gap-1 text-xs font-medium ${pct >= 70 ? 'text-emerald-400' : pct >= 50 ? 'text-amber-400' : 'text-red-400'}`}>
+        {pct >= 70
+          ? <CheckCircle2 className="w-3 h-3" />
+          : <AlertTriangle className="w-3 h-3" />}
+        {pct}% quality
+        {reasons.length > 0 && <ChevronDown className={`w-3 h-3 transition-transform ${open ? 'rotate-180' : ''}`} />}
+      </button>
+      {open && reasons.length > 0 && (
+        <div className="absolute top-6 left-0 z-10 bg-popover border border-border rounded-lg p-3 w-72 shadow-xl">
+          <p className="text-xs font-semibold mb-2 text-foreground">Why not 100%?</p>
+          <ul className="space-y-1.5">
+            {reasons.map((r, i) => (
+              <li key={i} className="text-xs text-muted-foreground flex items-start gap-1.5">
+                <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5 text-amber-400" />{r}
+              </li>
+            ))}
+          </ul>
+          <p className="text-xs text-muted-foreground/60 mt-2 pt-2 border-t border-border">
+            Increase score by providing more detailed facts, specific section numbers, and complete party names.
+          </p>
+        </div>
+      )}
+    </div>
+  )
 }
 
 export default function DraftingPage() {
@@ -217,7 +253,7 @@ export default function DraftingPage() {
                   <div className="flex items-center gap-3">
                     <PenTool className="w-4 h-4 text-primary" />
                     <span className="text-sm font-medium">{selectedType.label}</span>
-                    <ConfidenceBadge score={result.confidence} />
+                    <ConfidenceBadge score={result.confidence} notes={result.drafting_notes} />
                   </div>
                   <div className="flex items-center gap-2">
                     <button onClick={copyDraft}
@@ -238,6 +274,18 @@ export default function DraftingPage() {
 
                 {/* Metadata footer */}
                 <div className="border-t border-border px-4 py-3 space-y-2">
+                  {result.key_arguments?.length > 0 && (
+                    <div>
+                      <p className="text-xs font-medium text-muted-foreground mb-1.5">Key Arguments Used</p>
+                      <ul className="space-y-1">
+                        {result.key_arguments.map((arg: string, i: number) => (
+                          <li key={i} className="text-xs text-muted-foreground flex items-start gap-1.5">
+                            <CheckCircle2 className="w-3 h-3 shrink-0 mt-0.5 text-emerald-400" />{arg}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
                   {result.sections_cited?.length > 0 && (
                     <div className="flex flex-wrap gap-1.5">
                       {result.sections_cited.map((s, i) => (
