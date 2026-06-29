@@ -1,140 +1,193 @@
 services:
-  # ── PostgreSQL ───────────────────────────────────────────────────────────
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
-    container_name: nyaya_postgres
-    restart: unless-stopped
     environment:
       POSTGRES_DB: ${DB_NAME:-nyaya_ai}
       POSTGRES_USER: ${DB_USER:-nyaya_user}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-nyaya_pass}
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./infra/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./infra/docker/postgres/init.sql:/docker-entrypoint-initdb.d/00_extensions.sql
+      - ./backend/db/migrations/0001_initial.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    ports:
+      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-nyaya_user} -d ${DB_NAME:-nyaya_ai}"]
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 20s
-    command: >
-      postgres
-        -c shared_buffers=256MB
-        -c effective_cache_size=1GB
-        -c work_mem=16MB
-        -c max_connections=200
+      retries: 5
+    restart: unless-stopped
 
-  # ── Qdrant ───────────────────────────────────────────────────────────────
+  # ── Qdrant ──────────────────────────────────────────────────────────────────
   qdrant:
     image: qdrant/qdrant:v1.7.4
-    container_name: nyaya_qdrant
-    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+      # config mounted directly to the path Qdrant v1.7.x reads at startup
+      - ./infra/docker/qdrant/config.yaml:/qdrant/config/config.yaml
     ports:
       - "6333:6333"
       - "6334:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage
     environment:
-      QDRANT__SERVICE__HTTP_PORT: 6333
-      QDRANT__SERVICE__GRPC_PORT: 6334
-    # No healthcheck — qdrant v1.7.4 image is minimal, healthcheck causes false failures.
-    # Backend handles Qdrant not-yet-ready gracefully in lifespan startup.
-
-
-  # ── Redis ────────────────────────────────────────────────────────────────
-  redis:
-    image: redis:7-alpine
-    container_name: nyaya_redis
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: >
-      redis-server
-        --maxmemory 512mb
-        --maxmemory-policy allkeys-lru
-        --appendonly yes
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+      QDRANT__SERVICE__HTTP_PORT: "6333"
+      QDRANT__LOG_LEVEL: "INFO"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Pure TCP check — Qdrant image has no curl/wget
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/6333' && exit 0 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 10s
+      start_period: 20s
+    restart: unless-stopped
 
-  # ── Backend ──────────────────────────────────────────────────────────────
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server /usr/local/etc/redis/redis.conf
+    volumes:
+      - redis_data:/data
+      - ./infra/docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Backend (FastAPI) ────────────────────────────────────────────────────────
   backend:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    container_name: nyaya_backend
-    restart: unless-stopped
     env_file: .env
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
       QDRANT_HOST: qdrant
       QDRANT_PORT: 6333
+      QDRANT_GRPC_PORT: 6334
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      HF_HOME: /app/data/embeddings/models
-    ports:
-      - "8000:8000"
+      PYTHONPATH: /app
     volumes:
       - ./data:/app/data
       - model_cache:/app/data/embeddings/models
+    ports:
+      - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy
       redis:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
-      interval: 30s
-      timeout: 15s
-      # Long start_period: first run downloads BGE model (~1.3GB)
-      start_period: 180s
-      retries: 5
+    restart: unless-stopped
 
-  # ── Frontend ─────────────────────────────────────────────────────────────
+  # ── Frontend (Next.js) ───────────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: nyaya_frontend
-    restart: unless-stopped
     environment:
-      # Empty string means relative URLs — nginx proxies /api/* to backend
-      NEXT_PUBLIC_API_URL: ""
+      NEXT_PUBLIC_API_URL: http://localhost:8000
     ports:
       - "3000:3000"
-    # Don't wait for backend healthy — frontend is static, just needs to start
     depends_on:
       - backend
+    restart: unless-stopped
 
-  # ── Nginx ─────────────────────────────────────────────────────────────────
+  # ── Nginx reverse proxy ──────────────────────────────────────────────────────
   nginx:
     image: nginx:alpine
-    container_name: nyaya_nginx
-    restart: unless-stopped
-    ports:
-      - "80:80"
     volumes:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
     depends_on:
-      - frontend
       - backend
+      - frontend
+    restart: unless-stopped
+
+  # ── Optional services — uncomment to enable ──────────────────────────────────
+  #
+  # Celery parse worker (CPU — bulk PDF ingestion)
+  # celery-parser:
+  #   build:
+  #     context: .
+  #     dockerfile: backend/Dockerfile
+  #   env_file: .env
+  #   environment:
+  #     DB_HOST: postgres
+  #     QDRANT_HOST: qdrant
+  #     REDIS_HOST: redis
+  #     PYTHONPATH: /app
+  #   command: >
+  #     celery -A backend.ingestion.workers.celery_app worker
+  #     -Q nyaya_parse -c 8 --loglevel=info -n parser@%h
+  #   volumes:
+  #     - ./data:/app/data
+  #   depends_on:
+  #     - postgres
+  #     - redis
+  #
+  # Celery embed worker (GPU recommended)
+  # celery-embedder:
+  #   build:
+  #     context: .
+  #     dockerfile: backend/Dockerfile
+  #   env_file: .env
+  #   environment:
+  #     DB_HOST: postgres
+  #     QDRANT_HOST: qdrant
+  #     REDIS_HOST: redis
+  #     PYTHONPATH: /app
+  #     EMBEDDING_DEVICE: cpu
+  #   command: >
+  #     celery -A backend.ingestion.workers.celery_app worker
+  #     -Q nyaya_embed -c 2 --loglevel=info -n embedder@%h
+  #   volumes:
+  #     - ./data:/app/data
+  #     - model_cache:/app/data/embeddings/models
+  #   depends_on:
+  #     - postgres
+  #     - redis
+  #
+  # Celery Beat scheduler (runs flush_staged every 60s)
+  # celery-beat:
+  #   build:
+  #     context: .
+  #     dockerfile: backend/Dockerfile
+  #   env_file: .env
+  #   environment:
+  #     DB_HOST: postgres
+  #     REDIS_HOST: redis
+  #     PYTHONPATH: /app
+  #   command: >
+  #     celery -A backend.ingestion.workers.celery_app beat
+  #     --loglevel=info
+  #   depends_on:
+  #     - redis
+  #
+  # Elasticsearch (TB-scale BM25 — also set ES_ENABLED=true in .env)
+  # elasticsearch:
+  #   image: elasticsearch:8.13.0
+  #   environment:
+  #     - discovery.type=single-node
+  #     - ES_JAVA_OPTS=-Xms2g -Xmx2g
+  #     - xpack.security.enabled=false
+  #   volumes:
+  #     - es_data:/usr/share/elasticsearch/data
+  #   ports:
+  #     - "9200:9200"
 
 volumes:
   postgres_data:
   qdrant_data:
   redis_data:
   model_cache:
-
-networks:
-  default:
-    name: nyaya_network
+  # es_data:    # uncomment this line when you uncomment elasticsearch above

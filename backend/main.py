@@ -1,136 +1,152 @@
 """
-NyayaAI FastAPI Application.
+NyayaAI FastAPI application v2.
 
-Lifespan manages startup/shutdown of:
-- Database connections
-- Qdrant collection init
-- Model warm-up
-- Redis connection
+Changes from v1:
+- _get_model imported correctly from embeddings.service
+- SlowAPI rate limits wired per route (not just middleware)
+- AuditLog middleware logs user_id from JWT when present
+- Startup: ensures Qdrant collection exists before accepting traffic
+- GZip compression threshold lowered to 500 bytes for legal JSON responses
+- /api/v1/upload/chunked/* routes registered
+- DELETE /api/v1/chat/sessions/{id} registered
 """
 import logging
-import os
+import time
 from contextlib import asynccontextmanager
+from typing import Callable
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-from backend.api.middleware.audit import AuditLogMiddleware
-from backend.api.middleware.timing import TimingMiddleware
-from backend.api.routes import auth, chat, documents, drafting, health, search, upload
+from backend.api.routes import auth, chat, debug, documents, drafting, health, search, upload
 from backend.config.settings import get_settings
-from backend.db.session import close_db, init_db
-from backend.retrieval.vector.retriever import VectorRetriever
-from backend.utils.redis_client import get_redis_client
+from backend.db.session import check_db_connection
+from backend.embeddings.service import _get_model
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-)
 logger = logging.getLogger(__name__)
+_cfg = get_settings()
 
+
+# ── Lifespan (startup / shutdown) ────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown lifecycle management."""
-    settings = get_settings()
-    logger.info(f"Starting NyayaAI [{settings.app.environment}]")
+    logger.info("NyayaAI starting up...")
 
-    # Initialize PostgreSQL
-    await init_db()
-    logger.info("PostgreSQL ready")
-
-    # Initialize Qdrant collection
+    # Warm up embedding model (loads weights into memory once)
     try:
+        _get_model()
+        logger.info("Embedding model warmed up")
+    except Exception as e:
+        logger.error(f"Embedding model warmup failed: {e}")
+
+    # Ensure Qdrant collection exists with correct config
+    try:
+        from backend.retrieval.vector.retriever import VectorRetriever
         vr = VectorRetriever()
         await vr.ensure_collection()
-        logger.info("Qdrant collection ready")
     except Exception as e:
-        logger.warning(f"Qdrant init warning (non-fatal): {e}")
+        logger.warning(f"Qdrant collection check failed (Qdrant may be starting): {e}")
 
-    # Warm up Redis
-    try:
-        redis = await get_redis_client()
-        await redis.ping()
-        logger.info("Redis connected")
-    except Exception as e:
-        logger.warning(f"Redis not available (non-fatal): {e}")
+    # DB connectivity check
+    db_ok = await check_db_connection()
+    if not db_ok:
+        logger.error("Database connection failed at startup — queries will fail")
+    else:
+        logger.info("Database connection OK")
 
-    # Pre-load models in background to warm JIT
-    # (models load lazily, but we trigger them at startup)
-    try:
-        from backend.embeddings.service import _get_model
-        import asyncio
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _get_model)
-        logger.info("Embedding model loaded")
-    except Exception as e:
-        logger.warning(f"Model pre-load warning: {e}")
-
-    logger.info("NyayaAI startup complete")
+    logger.info(f"NyayaAI v{_cfg.app.app_version} ready "
+                f"[env={_cfg.app.environment}]")
     yield
 
-    # Shutdown
-    await close_db()
-    logger.info("NyayaAI shutdown complete")
+    logger.info("NyayaAI shutting down")
 
+
+# ── Rate limiter ──────────────────────────────────────────────────────────────
+
+limiter = Limiter(key_func=get_remote_address)
+
+
+# ── Application factory ───────────────────────────────────────────────────────
 
 def create_app() -> FastAPI:
-    settings = get_settings()
-
     app = FastAPI(
-        title="NyayaAI Legal Research Platform",
-        description="Production-grade Indian legal AI with BNS/BNSS/BSA retrieval",
-        version=settings.app.app_version,
-        docs_url="/api/docs" if not settings.app.is_production else None,
-        redoc_url="/api/redoc" if not settings.app.is_production else None,
+        title=_cfg.app.app_name,
+        version=_cfg.app.app_version,
+        description="AI-powered Indian legal research and drafting platform",
+        docs_url="/docs" if not _cfg.app.is_production else None,
+        redoc_url="/redoc" if not _cfg.app.is_production else None,
         lifespan=lifespan,
+        redirect_slashes=False,   # <-- ADD THIS LINE
     )
 
-    # ── Rate Limiter ─────────────────────────────
-    limiter = Limiter(key_func=get_remote_address)
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    app.add_middleware(SlowAPIMiddleware)
-
-    # ── CORS ─────────────────────────────────────
+    # ── Middleware stack (order matters — outermost added last) ───────────
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.app.allowed_origins,
+        allow_origins=_cfg.app.allowed_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(GZipMiddleware, minimum_size=500)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-    # ── Compression ───────────────────────────────
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    # Request timing + audit middleware
+    @app.middleware("http")
+    async def timing_and_audit(request: Request, call_next: Callable) -> Response:
+        t0 = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.0f}"
 
-    # ── Custom Middleware ─────────────────────────
-    app.add_middleware(TimingMiddleware)
-    app.add_middleware(AuditLogMiddleware)
+        # Audit log for mutating endpoints
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            path = request.url.path
+            user_id = None
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                try:
+                    from jose import jwt as _jwt
+                    token = auth_header[7:]
+                    payload = _jwt.decode(
+                        token, _cfg.auth.secret_key,
+                        algorithms=[_cfg.auth.algorithm],
+                        options={"verify_exp": False},
+                    )
+                    user_id = payload.get("sub")
+                except Exception:
+                    pass
+            logger.info(
+                f"AUDIT | {request.method} {path} | user={user_id} "
+                f"| status={response.status_code} | {elapsed_ms:.0f}ms"
+            )
 
-    # ── Routers ───────────────────────────────────
-    app.include_router(health.router, prefix="/api/v1", tags=["Health"])
-    app.include_router(auth.router, prefix="/api/v1/auth", tags=["Auth"])
-    app.include_router(search.router, prefix="/api/v1", tags=["Search"])
-    app.include_router(chat.router, prefix="/api/v1", tags=["Chat"])
-    app.include_router(upload.router, prefix="/api/v1", tags=["Upload"])
-    app.include_router(documents.router, prefix="/api/v1", tags=["Documents"])
-    app.include_router(drafting.router, prefix="/api/v1", tags=["Drafting"])
+        return response
 
-    # ── Global Exception Handler ──────────────────
-    @app.exception_handler(Exception)
-    async def global_exception_handler(request: Request, exc: Exception):
-        logger.error(f"Unhandled exception: {exc}", exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "Internal server error. Please try again."},
-        )
+    # ── Routers ───────────────────────────────────────────────────────────
+    prefix = "/api/v1"
+    app.include_router(health.router,     prefix=prefix)
+    app.include_router(auth.router,       prefix=prefix)
+    app.include_router(search.router,     prefix=prefix)
+    app.include_router(chat.router,       prefix=prefix)
+    app.include_router(upload.router,     prefix=prefix)
+    app.include_router(documents.router,  prefix=prefix)
+    app.include_router(drafting.router,   prefix=prefix)
+    app.include_router(debug.router,     prefix=prefix)
+
+    @app.get("/")
+    async def root():
+        return {
+            "service": _cfg.app.app_name,
+            "version": _cfg.app.app_version,
+            "environment": _cfg.app.environment,
+            "status": "running",
+        }
 
     return app
 

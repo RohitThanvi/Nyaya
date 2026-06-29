@@ -1,78 +1,370 @@
-"""Upload route — handles PDF/TXT document ingestion."""
+"""
+Upload route v3 — fail-proof resumable chunked upload.
+
+Real resume support added:
+1. GET /upload/chunked/{upload_id}/status — frontend calls this on reconnect
+   to find out exactly which byte ranges are already on disk, so it never
+   re-sends data after a network drop. This endpoint did not exist before;
+   without it, "resume" was impossible — the frontend had no way to know
+   what survived a disconnect.
+2. Idempotent chunk writes — re-sending the same Content-Range twice (which
+   happens on retry-after-timeout) no longer double-counts received_bytes.
+   Completion is now derived from actual file sizes on disk via the status
+   endpoint, never from a counter that can drift.
+3. Single-file path raised to 200MB (was 50MB), chunked path raised to 10GB
+   (was 2GB) — see backend/config/settings.py IngestionSettings.
+"""
+import json
+import logging
 import os
 import shutil
 import uuid
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.api.dependencies.auth import get_current_active_user
 from backend.api.dependencies.pipeline import get_embedding_service, get_vector_retriever
 from backend.config.settings import get_settings
+from backend.db.session import get_db
 from backend.embeddings.service import EmbeddingService
-from backend.ingestion.chunkers.legal_chunker import LegalChunker
-from backend.ingestion.parsers.document_parser import MetadataExtractor, PDFParser
 from backend.ingestion.pipeline.ingest import IngestionPipeline
-from backend.models.domain import UploadResponse, UserInDB
+from backend.models.domain import UploadResponse
 from backend.retrieval.vector.retriever import VectorRetriever
 
-router = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
-ALLOWED_TYPES = {"application/pdf", "text/plain"}
-MAX_MB = get_settings().app.max_upload_size_mb
+router = APIRouter(prefix="/upload", tags=["upload"])
+logger = logging.getLogger(__name__)
+_cfg = get_settings()
 
 
-@router.post("/upload", response_model=UploadResponse)
-@limiter.limit("5/minute")
+@router.post("/", response_model=UploadResponse)
 async def upload_document(
-    request: Request,
     file: UploadFile = File(...),
-    embedding_service: EmbeddingService = Depends(get_embedding_service),
-    vector_retriever: VectorRetriever = Depends(get_vector_retriever),
-    current_user: UserInDB = Depends(get_current_active_user),
-) -> UploadResponse:
-    """Upload and index a legal document for Q&A."""
-    if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(400, f"Only PDF and TXT files allowed. Got: {file.content_type}")
+    source_url: Optional[str] = Form(default=None),
+    db: AsyncSession = Depends(get_db),
+    embedder: EmbeddingService = Depends(get_embedding_service),
+    vector: VectorRetriever = Depends(get_vector_retriever),
+):
+    """
+    Single-shot upload for files up to APP_MAX_UPLOAD_SIZE_MB (default 200MB).
+    Anything larger should use the /upload/chunked/* flow.
+    """
+    max_bytes = _cfg.app.max_upload_size_mb * 1024 * 1024
+    if file.size and file.size > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"File exceeds the single-shot limit of {_cfg.app.max_upload_size_mb}MB. "
+                f"Files this large should use chunked upload, which supports files up to "
+                f"{_cfg.ingestion.max_file_size_gb}GB and resumes automatically after "
+                f"network interruptions."
+            ),
+        )
 
-    content = await file.read()
-    if len(content) > MAX_MB * 1024 * 1024:
-        raise HTTPException(413, f"File too large. Max {MAX_MB}MB")
+    if not file.filename or not file.filename.lower().endswith((".pdf", ".txt", ".docx")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only PDF, TXT, and DOCX files are supported.",
+        )
 
-    # Save temporarily
-    upload_dir = Path(get_settings().app.upload_dir)
+    upload_dir = Path(_cfg.app.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
-    suffix = Path(file.filename or "upload").suffix
-    tmp_path = str(upload_dir / f"{uuid.uuid4()}{suffix}")
-
-    with open(tmp_path, "wb") as f:
-        f.write(content)
+    tmp_path = upload_dir / f"{uuid.uuid4()}_{file.filename}"
 
     try:
-        pipeline = IngestionPipeline(
-            embedding_service=embedding_service,
-            vector_retriever=vector_retriever,
-            chunker=LegalChunker(),
-            pdf_parser=PDFParser(),
-            metadata_extractor=MetadataExtractor(),
+        content = await file.read()
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+
+        permanent_path = upload_dir / file.filename
+        if permanent_path.exists():
+            stem = Path(file.filename).stem
+            suffix = Path(file.filename).suffix
+            permanent_path = upload_dir / f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+        shutil.copy2(tmp_path, permanent_path)
+
+        pipeline = IngestionPipeline(db=db, embedding_service=embedder, vector_retriever=vector)
+        result = await pipeline.ingest_upload(
+            file_path=str(permanent_path),
+            original_filename=permanent_path.name,
+            source_url=source_url,
         )
-        doc_id, pages, chunks = await pipeline.ingest_upload(
-            file_path=tmp_path,
-            original_filename=file.filename or "upload",
-            user_id=str(current_user.user_id),
-        )
+
         return UploadResponse(
-            document_id=doc_id,
-            filename=file.filename or "upload",
-            pages=pages,
-            chunks_created=chunks,
-            status="success",
-            message=f"Document indexed. {chunks} searchable chunks created.",
+            document_id=result["document_id"],
+            filename=file.filename,
+            pages=result.get("pages", 0),
+            chunks_created=result.get("chunks_created", 0),
+            failed_chunk_ids=result.get("failed_chunk_ids", []),
+            status=result.get("status", "success"),
+            message=result.get("message", "Upload successful."),
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(500, f"Ingestion failed: {str(e)}")
+        logger.error(f"Upload failed for {file.filename}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Upload processing failed: {str(e)}",
+        )
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if tmp_path.exists():
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+# ── Chunked, resumable upload ────────────────────────────────────────────────
+
+def _chunked_dir(upload_id: str) -> Path:
+    return Path(_cfg.app.upload_dir) / "chunked" / upload_id
+
+
+def _read_meta(upload_id: str) -> dict:
+    meta_path = _chunked_dir(upload_id) / ".meta"
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="Upload session not found or expired")
+    with open(meta_path) as f:
+        return json.load(f)
+
+
+def _write_meta(upload_id: str, meta: dict) -> None:
+    meta_path = _chunked_dir(upload_id) / ".meta"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f)
+
+
+def _received_ranges(upload_id: str) -> list:
+    """
+    Derive actually-received byte ranges from files on disk, not from a
+    counter. This is what makes resume reliable — even if the process
+    crashed mid-upload, the chunk files on disk are still the source of
+    truth for what survived.
+    """
+    upload_dir = _chunked_dir(upload_id)
+    chunk_files = sorted(
+        [p for p in upload_dir.glob("chunk_*")],
+        key=lambda p: int(p.stem.split("_")[1]),
+    )
+    ranges = []
+    for p in chunk_files:
+        start = int(p.stem.split("_")[1])
+        size = p.stat().st_size
+        ranges.append({"start": start, "end": start + size - 1, "size": size})
+    return ranges
+
+
+@router.post("/chunked/init")
+async def init_chunked_upload(
+    filename: str = Form(...),
+    total_size: int = Form(...),
+    source_url: Optional[str] = Form(default=None),
+    resume_upload_id: Optional[str] = Form(default=None),
+):
+    """
+    Initialise a chunked upload session, OR reattach to an existing one.
+    If resume_upload_id is provided and that session still exists on disk,
+    its existing chunks are preserved and reported back so the frontend
+    can skip re-sending them — this is the actual resume mechanism.
+    """
+    max_bytes = int(_cfg.ingestion.max_file_size_gb * 1024 * 1024 * 1024)
+    if total_size > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size {total_size/1e9:.2f}GB exceeds maximum {_cfg.ingestion.max_file_size_gb}GB",
+        )
+
+    if resume_upload_id and _chunked_dir(resume_upload_id).exists():
+        meta = _read_meta(resume_upload_id)
+        if meta.get("filename") == filename and meta.get("total_size") == total_size:
+            ranges = _received_ranges(resume_upload_id)
+            return {
+                "upload_id": resume_upload_id,
+                "chunk_size_mb": _cfg.ingestion.chunk_size_mb,
+                "resumed": True,
+                "received_ranges": ranges,
+            }
+
+    upload_id = str(uuid.uuid4())
+    upload_dir = _chunked_dir(upload_id)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_meta(upload_id, {
+        "filename": filename,
+        "total_size": total_size,
+        "source_url": source_url,
+    })
+
+    return {
+        "upload_id": upload_id,
+        "chunk_size_mb": _cfg.ingestion.chunk_size_mb,
+        "resumed": False,
+        "received_ranges": [],
+    }
+
+
+@router.get("/chunked/{upload_id}/status")
+async def chunked_upload_status(upload_id: str):
+    """
+    Resume entry point. Frontend calls this after reconnecting following any
+    network interruption to find out exactly which byte ranges already made
+    it to disk, so it only re-sends what's missing — never the whole file.
+    """
+    meta = _read_meta(upload_id)
+    ranges = _received_ranges(upload_id)
+    received_bytes = sum(r["size"] for r in ranges)
+    return {
+        "upload_id": upload_id,
+        "filename": meta["filename"],
+        "total_size": meta["total_size"],
+        "received_bytes": received_bytes,
+        "received_ranges": ranges,
+        "complete": received_bytes >= meta["total_size"],
+    }
+
+
+@router.post("/chunked/{upload_id}")
+async def upload_chunk(
+    upload_id: str,
+    chunk: UploadFile = File(...),
+    content_range: str = Header(...),
+):
+    """
+    Upload a single chunk. Content-Range: bytes {start}-{end}/{total}
+    Idempotent: re-uploading the same start offset simply overwrites the
+    chunk file with identical bytes — safe under retry, never double-counts,
+    because completion is always derived from files on disk (see status
+    endpoint and _received_ranges), not an incrementing counter.
+    """
+    meta = _read_meta(upload_id)
+    upload_dir = _chunked_dir(upload_id)
+
+    try:
+        range_part = content_range.replace("bytes ", "")
+        range_str, total_str = range_part.split("/")
+        start, end = map(int, range_str.split("-"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Content-Range header")
+
+    chunk_data = await chunk.read()
+    if len(chunk_data) != (end - start + 1):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chunk size mismatch: Content-Range declares {end - start + 1} bytes, "
+                   f"received {len(chunk_data)} bytes. Retry this chunk.",
+        )
+
+    chunk_path = upload_dir / f"chunk_{start:020d}"
+    tmp_chunk_path = upload_dir / f".tmp_chunk_{start:020d}"
+    with open(tmp_chunk_path, "wb") as f:
+        f.write(chunk_data)
+    os.replace(tmp_chunk_path, chunk_path)  # atomic — never leaves a half-written chunk
+
+    ranges = _received_ranges(upload_id)
+    received_bytes = sum(r["size"] for r in ranges)
+
+    return {
+        "upload_id": upload_id,
+        "received_bytes": received_bytes,
+        "total_bytes": meta["total_size"],
+        "complete": received_bytes >= meta["total_size"],
+    }
+
+
+@router.post("/chunked/{upload_id}/finalise", response_model=UploadResponse)
+async def finalise_chunked_upload(
+    upload_id: str,
+    db: AsyncSession = Depends(get_db),
+    embedder: EmbeddingService = Depends(get_embedding_service),
+    vector: VectorRetriever = Depends(get_vector_retriever),
+):
+    """
+    Assemble all chunks in order and trigger ingestion.
+    Verifies total assembled size matches the declared total_size before
+    proceeding — catches any silent gap left by a missed chunk.
+    """
+    meta = _read_meta(upload_id)
+    upload_dir = _chunked_dir(upload_id)
+
+    chunk_files = sorted(
+        [p for p in upload_dir.glob("chunk_*")],
+        key=lambda p: int(p.stem.split("_")[1]),
+    )
+    if not chunk_files:
+        raise HTTPException(status_code=400, detail="No chunks uploaded yet")
+
+    ranges = _received_ranges(upload_id)
+    received_bytes = sum(r["size"] for r in ranges)
+    if received_bytes < meta["total_size"]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Upload incomplete: {received_bytes}/{meta['total_size']} bytes received. "
+                f"Call /upload/chunked/{upload_id}/status to find missing ranges and resume."
+            ),
+        )
+
+    assembled_path = upload_dir / meta["filename"]
+    try:
+        with open(assembled_path, "wb") as out:
+            for chunk_file in chunk_files:
+                with open(chunk_file, "rb") as cf:
+                    shutil.copyfileobj(cf, out, length=1024 * 1024)
+
+        actual_size = assembled_path.stat().st_size
+        if actual_size != meta["total_size"]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Assembled file size {actual_size} does not match declared "
+                    f"total_size {meta['total_size']}. A chunk may be corrupted. "
+                    f"Re-run finalise after re-checking status."
+                ),
+            )
+
+        # Move to permanent upload storage so /documents/{id}/view can serve it
+        final_dir = Path(_cfg.app.upload_dir)
+        final_dir.mkdir(parents=True, exist_ok=True)
+        final_path = final_dir / meta["filename"]
+        if final_path.exists():
+            stem = Path(meta["filename"]).stem
+            suffix = Path(meta["filename"]).suffix
+            final_path = final_dir / f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+        shutil.move(str(assembled_path), str(final_path))
+
+        pipeline = IngestionPipeline(db=db, embedding_service=embedder, vector_retriever=vector)
+        result = await pipeline.ingest_upload(
+            file_path=str(final_path),
+            original_filename=final_path.name,
+            source_url=meta.get("source_url"),
+        )
+
+        return UploadResponse(
+            document_id=result["document_id"],
+            filename=meta["filename"],
+            pages=result.get("pages", 0),
+            chunks_created=result.get("chunks_created", 0),
+            failed_chunk_ids=result.get("failed_chunk_ids", []),
+            status=result.get("status", "success"),
+            message=result.get("message", "Chunked upload successful."),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Finalise failed for upload {upload_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Finalise failed: {str(e)}")
+    finally:
+        try:
+            shutil.rmtree(upload_dir)
+        except Exception:
+            pass
+
+
+@router.delete("/chunked/{upload_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def abandon_chunked_upload(upload_id: str):
+    """Explicitly cancel and clean up an in-progress chunked upload."""
+    upload_dir = _chunked_dir(upload_id)
+    if upload_dir.exists():
+        shutil.rmtree(upload_dir)

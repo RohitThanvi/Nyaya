@@ -1,12 +1,21 @@
-// NyayaAI TypeScript domain types — mirrors Python domain models
+/**
+ * NyayaAI API type definitions v2.
+ *
+ * Changes:
+ * - Citation: source_url, page_number, snippet, deep_link, verified
+ * - Document: parties typed as Record<string,string>, source_url
+ * - LegalResponse: hallucination_flags
+ * - UploadResponse: source_url
+ */
 
-export type DocumentType = 'judgment' | 'statute' | 'notification' | 'circular' | 'upload'
 export type LawCategory = 'BNS' | 'BNSS' | 'BSA' | 'IPC' | 'CrPC' | 'Constitution' | 'Other'
 export type CourtType = 'Supreme Court' | 'High Court' | 'District Court' | 'Tribunal' | 'Other'
-export type ChunkType = 'facts' | 'issues' | 'arguments' | 'findings' | 'ratio' | 'final_order' | 'chapter' | 'section' | 'subsection' | 'explanation' | 'punishment' | 'passage'
-export type LegalIntentType = 'provision_lookup' | 'case_search' | 'procedure_query' | 'drafting_request' | 'summarization' | 'general_query'
-export type DraftType = 'bail_application' | 'anticipatory_bail' | 'legal_notice' | 'affidavit' | 'complaint' | 'fir_quashing_petition' | 'written_statement' | 'vakalatnama'
+export type DocumentType = 'judgment' | 'statute' | 'notification' | 'circular' | 'upload'
 export type UserRole = 'admin' | 'advocate' | 'researcher' | 'student' | 'guest'
+export type DraftType =
+  | 'bail_application' | 'anticipatory_bail' | 'legal_notice'
+  | 'affidavit' | 'complaint' | 'fir_quashing_petition'
+  | 'written_statement' | 'vakalatnama'
 
 export interface Citation {
   citation_id: string
@@ -15,31 +24,40 @@ export interface Citation {
   section?: string
   subsection?: string
   paragraph?: number
+  page_number?: number        // physical page in source PDF
   citation_text: string
-  citation_type: string
+  citation_type: string       // 'statute' | 'judgment'
   court?: string
   year?: number
+  source_url?: string         // direct link to source document
+  snippet?: string            // first 150 chars of matching chunk
   relevance_note?: string
   verified: boolean
+  deep_link?: string          // source_url#page=N
 }
 
 export interface RelevantSection {
-  section_number: string
-  law: LawCategory
-  title: string
-  relevance: string
-  elements_to_prove: string[]
-  confidence: 'HIGH' | 'MEDIUM' | 'LOW'
-  punishment?: string
-  citation_chunk_id?: string
+  section?: string
+  subsection?: string
+  citation_text: string
+  snippet?: string
+  source_url?: string
+  page_number?: number
+  deep_link?: string
+  verified: boolean
+  relevance_score?: number
 }
 
 export interface Precedent {
   citation: string
-  court: string
+  court?: string
   year?: number
-  relevance: string
-  score: number
+  snippet?: string
+  source_url?: string
+  page_number?: number
+  deep_link?: string
+  verified: boolean
+  relevance_score?: number
 }
 
 export interface LegalResponse {
@@ -73,36 +91,57 @@ export interface SearchRequest {
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
-  timestamp: string
+  timestamp?: string
 }
 
 export interface ChatRequest {
   session_id?: string
   message: string
-  history: ChatMessage[]
+  history?: ChatMessage[]
   law_filter?: LawCategory[]
-  document_id?: string
+  document_id?: string        // scoped retrieval within a single document
   stream?: boolean
 }
 
-export interface DraftRequest {
-  draft_type: DraftType
-  facts: string
-  parties: Record<string, string>
-  court?: string
-  sections_involved?: string[]
-  additional_context?: string
+export interface Document {
+  document_id: string
+  document_type: DocumentType
+  law?: LawCategory
+  court?: CourtType
+  court_name?: string
+  case_number?: string
+  citation?: string
+  year?: number
+  date_decided?: string
+  bench?: string[]
+  parties?: Record<string, string>   // typed as object, not string
+  topic?: string
+  keywords?: string[]
+  source_url?: string                // canonical public URL
+  access_url?: string                // source_url OR internal /view fallback
+  original_filename?: string
+  is_landmark: boolean
+  language: string
+  pages: number
+  total_chunks?: number              // computed server-side via COUNT(*), not a stored column
+  created_at: string
 }
 
-export interface DraftResponse {
-  draft_type: string
-  content: string
-  sections_cited: string[]
-  key_arguments: string[]
-  drafting_notes: string[]
-  confidence: number
-  template_used: string
-  session_id: string
+export interface PaginatedDocuments {
+  documents: Document[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface DocumentListParams {
+  law?: string
+  court?: string
+  year?: number
+  document_type?: string
+  search?: string
+  page?: number
+  page_size?: number
 }
 
 export interface JudgmentSummary {
@@ -122,19 +161,6 @@ export interface JudgmentSummary {
   summary_brief: string
 }
 
-export interface Document {
-  document_id: string
-  document_type: DocumentType
-  law?: LawCategory
-  court_name?: string
-  citation?: string
-  year?: number
-  topic?: string
-  total_chunks: number
-  is_landmark: boolean
-  created_at: string
-}
-
 export interface UploadResponse {
   document_id: string
   filename: string
@@ -144,11 +170,21 @@ export interface UploadResponse {
   message: string
 }
 
-export interface ChatSession {
+export interface DraftRequest {
+  draft_type: DraftType
+  facts: string
+  parties: Record<string, string>
+  court?: string
+  sections_involved?: string[]
+  additional_context?: string
+}
+
+export interface DraftResponse {
+  query: string
   session_id: string
-  title?: string
-  created_at: string
-  updated_at: string
+  answer: string
+  warnings: string[]
+  confidence: number
 }
 
 export interface TokenResponse {
@@ -161,6 +197,13 @@ export interface TokenResponse {
 export interface User {
   user_id: string
   email: string
-  full_name: string
+  full_name?: string
   role: UserRole
+}
+
+export interface ChatSession {
+  session_id: string
+  title?: string
+  created_at: string
+  updated_at: string
 }

@@ -7,6 +7,7 @@ import { useSearchStore } from '@/lib/store'
 import type { LegalResponse, LawCategory, RelevantSection, Precedent } from '@/types/api'
 import { toast } from 'sonner'
 import ReactMarkdown from 'react-markdown'
+import { CitationList } from '@/components/citations/CitationCard'
 import remarkGfm from 'remark-gfm'
 
 const LAW_OPTIONS: LawCategory[] = ['BNS', 'BNSS', 'BSA', 'IPC', 'CrPC', 'Constitution']
@@ -25,7 +26,7 @@ function ConfidenceBadge({ score }: { score: number }) {
 
 function SectionCard({ section }: { section: RelevantSection }) {
   const [expanded, setExpanded] = useState(false)
-  const confColor = section.confidence === 'HIGH' ? 'text-emerald-400' : section.confidence === 'MEDIUM' ? 'text-amber-400' : 'text-red-400'
+  const confColor = section.verified ? 'text-emerald-400' : section.relevance_score && section.relevance_score > 0.6 ? 'text-amber-400' : 'text-muted-foreground'
   return (
     <div className="border border-border rounded-lg bg-card/50 overflow-hidden">
       <button
@@ -307,20 +308,19 @@ export default function SearchPage() {
               </div>
             )}
 
+            {/* Hallucination warnings */}
+            {result.hallucination_flags?.length > 0 && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                <p className="text-xs font-semibold text-amber-400 mb-1">⚠ Unverified citations detected</p>
+                {result.hallucination_flags.map((flag, i) => (
+                  <p key={i} className="text-xs text-amber-300/80">{flag}</p>
+                ))}
+              </div>
+            )}
+
             {/* Citations */}
             {result.citations?.length > 0 && (
-              <div>
-                <h3 className="text-sm font-semibold mb-2 text-muted-foreground uppercase tracking-wide text-xs">Verified Citations</h3>
-                <div className="flex flex-wrap gap-2">
-                  {result.citations.map((cit, i) => (
-                    <span key={i} className="citation-card flex items-center gap-1.5">
-                      {cit.verified && <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />}
-                      {cit.citation_text}
-                      {cit.section && <span className="text-muted-foreground">§{cit.section}</span>}
-                    </span>
-                  ))}
-                </div>
-              </div>
+              <CitationList citations={result.citations} />
             )}
           </div>
         )}

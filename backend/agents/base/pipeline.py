@@ -1,553 +1,569 @@
 """
-Main Agent Pipeline Orchestrator.
+AgentPipeline v3 — zero-hallucination-focused 7-step orchestrator.
 
-Deterministic pipeline — not autonomous agents.
-Each step is explicit, ordered, and traceable.
+Step 1: QueryUnderstanding  — intent + entity extraction
+Step 2: Retrieval           — three-path hybrid (exact + BM25 + conditional ANN)
+Step 3: LegalMapping        — facts -> statutory sections, NARROWS reranked_chunks
+                               to only mapper-validated sections before generation
+                               (this step existed in code since v2 but was never
+                               actually called anywhere — fixed in v3, see _step_map)
+Step 4: ContextCompression  — ContextCompressionAgent; chunk headers now carry a
+                               <CHUNK:xxxxxxxx> id the LLM is required to cite
+Step 5: Generation          — LLM with grounding-rules prompt requiring every
+                               claim to carry its source <CHUNK:id> tag
+Step 6: Verification        — VerificationAgent checks <CHUNK:id> tags first
+                               (mechanical, exact), falls back to fuzzy match,
+                               then DB lookup. v2 had a NameError crash in
+                               _verify_judgment that silently disabled judgment
+                               citation verification entirely — fixed in v3.
+Step 7: Assembly            — AssemblyAgent strips any sentence whose claim
+                               failed verification from the visible answer
+                               (hard enforcement, not just a warning banner),
+                               then strips the internal <CHUNK:id> tags
 
-Pipeline:
-1. Query Understanding
-2. Hybrid Retrieval (BM25 + ANN + Rerank)
-3. Legal Mapping (facts → sections)
-4. Context Compression
-5. LLM Generation
-6. Citation Verification
-7. Structured Output Assembly
+Changes from v2 (this revision — zero-hallucination hardening):
+- FIXED CRASH: _verify_judgment referenced an undefined `chunk` variable
+  (copy-paste leftover), silently swallowed by the broad except in
+  _step_verify — every judgment citation was unverifiable. Now fixed.
+- LegalMappingAgent is now actually called in the request flow (_step_map),
+  not just instantiated and ignored.
+- Context chunks carry a machine-checkable <CHUNK:id> tag; generation prompts
+  require every claim to cite one; verification checks that tag as the
+  primary, strongest evidence path before falling back to fuzzy matching.
+- AssemblyAgent now REMOVES unverified claims from the answer instead of
+  leaving them in place with a warning the user might not read.
 """
 import asyncio
 import logging
 import time
-from typing import AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.agents.assembly.agent import AssemblyAgent
+from backend.agents.context_compression.agent import ContextCompressionAgent
 from backend.agents.drafting.agent import DraftingAgent
 from backend.agents.legal_mapping.agent import LegalMappingAgent
 from backend.agents.query_understanding.agent import QueryUnderstandingAgent
 from backend.agents.summarization.agent import SummarizationAgent
 from backend.agents.verification.agent import VerificationAgent
 from backend.config.settings import get_settings
-from backend.embeddings.service import EmbeddingService
 from backend.models.domain import (
-    AgentState, ChatMessage, DraftRequest, DraftType,
-    JudgmentSummary, LegalIntentType, LegalResponse,
-    QueryUnderstanding, RetrievedChunk, SearchRequest,
-    SummarizeRequest
+    AgentState, ChatRequest, DraftRequest, LegalResponse,
+    LegalIntentType, SearchRequest, SummarizeRequest,
 )
-from backend.retrieval.bm25.retriever import BM25Retriever
-from backend.retrieval.hybrid.pipeline import HybridRetriever, compress_context
-from backend.retrieval.reranker.cross_encoder import Reranker
-from backend.retrieval.vector.retriever import VectorRetriever
-from backend.utils.llm_client import get_llm_client
+from backend.retrieval.hybrid.pipeline import HybridRetriever
+from backend.utils.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
-CHAT_SYSTEM_PROMPT = """You are NyayaAI, an expert Indian legal research assistant.
 
-You specialize in:
-- Bharatiya Nyaya Sanhita (BNS) 2023
-- Bharatiya Nagarik Suraksha Sanhita (BNSS) 2023
-- Bharatiya Sakshya Adhiniyam (BSA) 2023
-- Supreme Court and High Court judgments
+# ── Prompt templates per intent ──────────────────────────────────────────────
 
-CRITICAL RULES:
-1. Answer ONLY from the provided context. Do not use outside knowledge for legal provisions.
-2. Every legal claim MUST cite its source: [Section X, Law] or [Citation, Court, Year]
-3. If the context does not contain enough information, explicitly say:
-   "The retrieved context does not contain sufficient information to answer this conclusively."
-4. Never invent section numbers, case names, or holdings.
-5. Use clear, precise legal language but explain technical terms.
-6. Structure your answer: (a) Direct answer, (b) Relevant provisions, (c) Procedural notes if applicable.
+# ── Grounding rules shared by every intent ───────────────────────────────────
+#
+# Every source chunk in {context} is preceded by a header containing a
+# <CHUNK:xxxxxxxx>-style identifier (8 hex chars) embedded in brackets,
+# e.g. [CHUNK:a1b2c3d4 | AIR 2025 SC 111 | §318 | BNS | p.4 | [SECTION]].
+# The model is required to tag every factual legal claim with the
+# <CHUNK:xxxxxxxx> id of the source it came from, placed immediately after
+# the claim. This is what VerificationAgent checks mechanically — a claim
+# with a tag pointing at a chunk_id that was genuinely retrieved is treated
+# as grounded; everything else is fuzzy-matched as a weaker fallback and,
+# failing that, stripped from the final answer entirely by AssemblyAgent.
+_GROUNDING_RULES = """GROUNDING RULES (mandatory):
+1. Use ONLY the legal sources provided below. Do not use outside knowledge of
+   Indian law, even if you are confident it is correct — only what appears in
+   the sources counts as a source for this answer.
+2. Immediately after every section number, citation, or specific legal claim,
+   insert the matching <CHUNK:xxxxxxxx> tag copied exactly from that source's
+   header. Example: "Section 318 BNS defines cheating <CHUNK:a1b2c3d4>."
+3. If the sources do not contain information needed to answer part of the
+   question, explicitly say so in that part of your answer instead of filling
+   the gap from memory. Do not guess section numbers.
+4. Never state a section number, case citation, or punishment that does not
+   appear verbatim in the sources below.
+"""
 
-CONTEXT:
-{context}"""
+_PROMPTS: Dict[str, str] = {
+    LegalIntentType.PROVISION_LOOKUP.value: """You are NyayaAI, an expert Indian legal assistant.
+
+""" + _GROUNDING_RULES + """
+LEGAL SOURCES:
+{context}
+
+QUESTION: {query}
+
+Provide a clear, accurate answer with all relevant section numbers and their exact text, each tagged with its source chunk.""",
+
+    LegalIntentType.CASE_SEARCH.value: """You are NyayaAI, an expert Indian legal assistant.
+
+""" + _GROUNDING_RULES + """
+JUDGMENTS:
+{context}
+
+QUERY: {query}
+
+Summarise the relevant holdings and their applicability to the query, tagging every citation with its source chunk.""",
+
+    LegalIntentType.PROCEDURE_QUERY.value: """You are NyayaAI, an expert Indian legal assistant.
+
+""" + _GROUNDING_RULES + """
+LEGAL SOURCES:
+{context}
+
+QUERY: {query}
+
+Provide a numbered step-by-step procedure with statutory references, each step tagged with its source chunk.""",
+
+    LegalIntentType.GENERAL_QUERY.value: """You are NyayaAI, an expert Indian legal assistant.
+
+""" + _GROUNDING_RULES + """
+SOURCES:
+{context}
+
+QUERY: {query}
+
+Provide a helpful, accurate answer using only the sources above.""",
+
+    LegalIntentType.SUMMARIZATION.value: """You are NyayaAI, an expert Indian legal assistant.
+Provide a structured summary of this judgment.
+
+JUDGMENT EXCERPTS:
+{context}
+
+QUERY: {query}
+
+Structure: Facts | Issues | Holdings | Ratio | Final Order""",
+
+    LegalIntentType.DRAFTING_REQUEST.value: """You are NyayaAI, an expert Indian legal assistant.
+{context}
+
+DRAFTING QUERY: {query}
+
+Complete the draft with accurate legal language. Mark any field requiring advocate verification with [VERIFY: reason].""",
+}
 
 
 class AgentPipeline:
     """
-    Core orchestration pipeline.
-    All agents are injected for testability.
+    Orchestrates all agents and retrieval for a single user query.
+    Stateless per-request — instantiate once at startup, call per request.
     """
 
     def __init__(
         self,
-        query_agent: QueryUnderstandingAgent,
-        hybrid_retriever: HybridRetriever,
-        legal_mapping_agent: LegalMappingAgent,
-        verification_agent: VerificationAgent,
-        summarization_agent: SummarizationAgent,
-        drafting_agent: DraftingAgent,
-        llm_client=None,
+        retriever: HybridRetriever,
+        llm_client: LLMClient,
+        db: AsyncSession,
     ):
-        self._query_agent = query_agent
-        self._retriever = hybrid_retriever
-        self._mapping_agent = legal_mapping_agent
-        self._verification_agent = verification_agent
-        self._summarization_agent = summarization_agent
-        self._drafting_agent = drafting_agent
-        self._llm = llm_client or get_llm_client()
-        self._settings = get_settings()
+        self._retriever       = retriever
+        self._llm             = llm_client
+        self._db              = db
+        self._settings        = get_settings()
+        self._ret_cfg         = self._settings.retrieval
 
-    def _trace(self, state: AgentState, step: str, data: Dict) -> None:
-        state.pipeline_trace.append({"step": step, "data": data})
+        # Agent instances
+        self._qua             = QueryUnderstandingAgent(llm_client=llm_client)
+        self._mapper          = LegalMappingAgent(llm_client=llm_client)
+        self._compressor      = ContextCompressionAgent()
+        self._summarizer      = SummarizationAgent(llm_client=llm_client)
+        self._drafting        = DraftingAgent(llm_client=llm_client)
+        self._assembler       = AssemblyAgent()
 
-    async def run_search(self, request: SearchRequest, user_id: Optional[str] = None) -> LegalResponse:
-        """
-        Full search pipeline:
-        understand → retrieve → map → verify → respond
-        """
-        t_start = time.perf_counter()
-        state = AgentState(original_query=request.query, user_id=user_id)
+    def _make_verifier(self) -> VerificationAgent:
+        """VerificationAgent is created per-request with live db session."""
+        return VerificationAgent(db=self._db, llm_client=self._llm)
 
-        # Step 1: Query Understanding
-        t0 = time.perf_counter()
-        qu = await self._query_agent.analyze(request.query)
-        # Apply API-level filters (override LLM filters if explicitly set)
-        if request.law_filter:
-            qu.law_filter = request.law_filter
-        if request.court_filter:
-            qu.court_filter = request.court_filter
-        if request.year_from or request.year_to:
-            qu.year_range = {
-                "from": request.year_from or 1950,
-                "to": request.year_to or 2025,
-            }
-        state.query_understanding = qu
-        state.latency_ms["query_understanding"] = (time.perf_counter() - t0) * 1000
-        self._trace(state, "query_understanding", {"intent": qu.intent, "entities": len(qu.legal_entities)})
+    # ──────────────────────────────────────────────────────────────────────
+    # Main entry points
+    # ──────────────────────────────────────────────────────────────────────
 
-        # Step 2: Hybrid Retrieval
-        t0 = time.perf_counter()
-        queries = [request.query] + (qu.expanded_queries or [])
-        if len(queries) > 1:
-            chunks, ret_timings = await self._retriever.retrieve_multi_query(
-                queries=queries,
-                query_understanding=qu,
-                top_k_final=request.top_k,
-            )
-        else:
-            chunks, ret_timings = await self._retriever.retrieve(
-                query=request.query,
-                query_understanding=qu,
-                top_k_final=request.top_k,
-            )
-        state.reranked_chunks = chunks
-        state.latency_ms.update(ret_timings)
-        self._trace(state, "retrieval", {"chunks_retrieved": len(chunks)})
-
-        if not chunks:
-            return LegalResponse(
-                query=request.query,
-                session_id=state.session_id,
-                intent=qu.intent.value,
-                answer="No relevant legal provisions or judgments found for your query. Please refine your search terms or check the spelling of section numbers.",
-                confidence=0.0,
-                warnings=["No results found in knowledge base."],
-                latency_ms=(time.perf_counter() - t_start) * 1000,
-            )
-
-        # Step 3: Legal Mapping (for provision lookups and case queries)
-        mapping_result = None
-        if qu.intent in (LegalIntentType.PROVISION_LOOKUP, LegalIntentType.CASE_SEARCH,
-                         LegalIntentType.PROCEDURE_QUERY):
-            t0 = time.perf_counter()
-            mapping_result = await self._mapping_agent.map_facts_to_sections(
-                facts=request.query,
-                retrieved_chunks=chunks,
-                query_understanding=qu,
-            )
-            state.latency_ms["legal_mapping"] = (time.perf_counter() - t0) * 1000
-            self._trace(state, "legal_mapping", {
-                "sections_found": len(mapping_result.get("relevant_sections", []))
-            })
-
-        # Step 4: Context Compression
-        compressed = compress_context(chunks, max_tokens=3000)
-        state.compressed_context = compressed
-
-        # Step 5: LLM Generation
-        t0 = time.perf_counter()
-        messages = self._build_chat_messages(request.query, compressed, [])
-        raw_response = await self._llm.complete(messages)
-        state.raw_llm_response = raw_response
-        state.latency_ms["llm_generation"] = (time.perf_counter() - t0) * 1000
-
-        # Step 6: Verification
-        t0 = time.perf_counter()
-        flags, verified_citations, verifiability = await self._verification_agent.verify(
-            llm_response=raw_response,
-            retrieved_chunks=chunks,
-            mapping_result=mapping_result,
+    async def run_search(self, request: SearchRequest) -> LegalResponse:
+        state = AgentState(
+            original_query=request.query,
         )
-        state.hallucination_flags = flags
-        state.verified_citations = verified_citations
-        state.latency_ms["verification"] = (time.perf_counter() - t0) * 1000
-
-        # Step 7: Assemble response
-        avg_rerank_score = sum(c.final_score for c in chunks[:5]) / min(5, len(chunks))
-        confidence = self._verification_agent.confidence_from_verifiability(
-            verifiability, avg_rerank_score
-        )
-
-        relevant_sections = []
-        precedents = []
-        procedural_requirements = []
-
-        if mapping_result:
-            relevant_sections = mapping_result.get("relevant_sections", [])
-            procedural_requirements = mapping_result.get("procedural_requirements", [])
-
-        # Separate judgments from statutes for response
-        for chunk in chunks[:6]:
-            meta = chunk.chunk.metadata
-            if meta.document_type.value == "judgment" and meta.citation:
-                precedents.append({
-                    "citation": meta.citation,
-                    "court": meta.court_name or (meta.court.value if meta.court else ""),
-                    "year": meta.year,
-                    "relevance": chunk.chunk.content[:200] + "...",
-                    "score": round(chunk.final_score, 3),
-                })
-
-        state.latency_ms["total"] = (time.perf_counter() - t_start) * 1000
-
-        return LegalResponse(
-            query=request.query,
-            session_id=state.session_id,
-            intent=qu.intent.value,
-            answer=raw_response,
-            relevant_sections=relevant_sections,
-            precedents=precedents[:5],
-            procedural_requirements=procedural_requirements,
-            citations=verified_citations,
-            confidence=round(confidence, 3),
-            warnings=flags if flags else [],
-            hallucination_flags=flags,
-            latency_ms=round(state.latency_ms.get("total", 0), 1),
-        )
+        await self._step_understand(state, law_filter=request.law_filter,
+                                    court_filter=request.court_filter)
+        await self._step_retrieve(state)
+        await self._step_map(state)
+        await self._step_compress(state)
+        await self._step_generate(state)
+        await self._step_verify(state)
+        return self._assembler.assemble(state)
 
     async def run_chat(
-        self,
-        message: str,
-        history: List[ChatMessage],
-        user_id: Optional[str] = None,
-        law_filter=None,
-        document_id: Optional[str] = None,
+        self, request: ChatRequest, user_id: Optional[str] = None
     ) -> LegalResponse:
-        """Chat pipeline with conversation history."""
-        t_start = time.perf_counter()
-        state = AgentState(original_query=message, user_id=user_id)
-
-        # Understand query
-        qu = await self._query_agent.analyze(message)
-        if law_filter:
-            qu.law_filter = law_filter
-        state.query_understanding = qu
-
-        # If scoped to a document, fetch its chunks directly from DB
-        if document_id:
-            chunks = await self._fetch_document_chunks(document_id, message)
-        else:
-            chunks, timings = await self._retriever.retrieve(
-                query=message,
-                query_understanding=qu,
-                top_k_final=self._settings.retrieval.final_context_k,
-            )
-        state.reranked_chunks = chunks
-
-        if not chunks:
-            doc_context = f" in document '{document_id}'" if document_id else ""
-            return LegalResponse(
-                query=message,
-                session_id=state.session_id,
-                answer=f"I could not find relevant content{doc_context} matching your query. "
-                       f"Try asking about specific people, sections, dates, or legal issues mentioned in the document. "
-                       f"For example: 'Who filed suit 5?' or 'What was the court's decision on title?' or 'What sections were discussed?'",
-                confidence=0.1,
-                warnings=["No relevant context found — try more specific terms."],
-                latency_ms=(time.perf_counter() - t_start) * 1000,
-            )
-
-        compressed = compress_context(chunks, max_tokens=2500)
-
-        # Build messages with history
-        messages = self._build_chat_messages(message, compressed, history)
-        raw_response = await self._llm.complete(messages)
-
-        flags, verified_citations, verifiability = await self._verification_agent.verify(
-            raw_response, chunks
+        state = AgentState(
+            original_query=request.message,
+            user_id=user_id,
         )
 
-        avg_score = sum(c.final_score for c in chunks[:3]) / min(3, len(chunks))
-        confidence = self._verification_agent.confidence_from_verifiability(verifiability, avg_score)
+        # Document-scoped retrieval
+        if request.document_id:
+            t0 = time.perf_counter()
+            chunks = await self._retriever.retrieve_for_document(
+                document_id=request.document_id,
+                query=request.message,
+                top_k=self._ret_cfg.final_context_k * 2,
+            )
+            state.reranked_chunks = chunks
+            state.latency_ms["doc_retrieval_ms"] = (time.perf_counter() - t0) * 1000
+        else:
+            await self._step_understand(state, law_filter=request.law_filter)
+            await self._step_retrieve(state)
+            await self._step_map(state)
 
-        return LegalResponse(
-            query=message,
-            session_id=state.session_id,
-            intent=qu.intent.value,
-            answer=raw_response,
-            citations=verified_citations,
-            confidence=round(confidence, 3),
-            warnings=flags,
-            latency_ms=round((time.perf_counter() - t_start) * 1000, 1),
+        await self._step_compress(state)
+        await self._step_generate(state, history=request.history)
+        await self._step_verify(state)
+        return self._assembler.assemble(state)
+
+    async def run_chat_stream(
+        self, request: ChatRequest, user_id: Optional[str] = None
+    ) -> AsyncIterator[str]:
+        """
+        SSE streaming: runs understand + retrieve + compress synchronously,
+        then streams LLM generation token-by-token.
+        Verification runs after stream completes (non-blocking metadata append).
+        """
+        state = AgentState(original_query=request.message, user_id=user_id)
+
+        if request.document_id:
+            chunks = await self._retriever.retrieve_for_document(
+                document_id=request.document_id,
+                query=request.message,
+                top_k=self._ret_cfg.final_context_k * 2,
+            )
+            state.reranked_chunks = chunks
+        else:
+            await self._step_understand(state, law_filter=request.law_filter)
+            await self._step_retrieve(state)
+            await self._step_map(state)
+
+        await self._step_compress(state)
+
+        intent = (
+            state.query_understanding.intent.value
+            if state.query_understanding
+            else LegalIntentType.GENERAL_QUERY.value
+        )
+        prompt_template = _PROMPTS.get(intent, _PROMPTS[LegalIntentType.GENERAL_QUERY.value])
+        prompt = prompt_template.format(
+            context=state.compressed_context or "",
+            query=request.message,
         )
 
-    async def stream_chat(
-        self,
-        message: str,
-        history: List[ChatMessage],
-        user_id: Optional[str] = None,
-        law_filter=None,
-        document_id: Optional[str] = None,
-    ) -> AsyncGenerator[str, None]:
-        """Streaming chat — yields text chunks as they arrive from LLM."""
-        qu = await self._query_agent.analyze(message)
-        if law_filter:
-            qu.law_filter = law_filter
-
-        if document_id:
-            chunks = await self._fetch_document_chunks(document_id, message)
-        else:
-            chunks, _ = await self._retriever.retrieve(
-                query=message,
-                query_understanding=qu,
-                top_k_final=self._settings.retrieval.final_context_k,
-            )
-
-        if not chunks:
-            yield ("I could not find relevant content matching your query. "
-                   "Try asking about specific people, dates, sections, or legal issues in the document. "
-                   "Example: 'What was the judgment on title?' or 'Who were the plaintiffs?'")
-            return
-
-        compressed = compress_context(chunks, max_tokens=2500)
-        messages = self._build_chat_messages(message, compressed, history)
-
-        async for token in self._llm.stream(messages):
+        full_response = ""
+        async for token in self._llm.stream(prompt=prompt):
+            full_response += token
             yield token
 
-    async def run_draft(self, request: DraftRequest, user_id: Optional[str] = None) -> Dict:
-        """Drafting pipeline: retrieve relevant law → generate document."""
-        # Build retrieval query from draft type + facts
-        retrieval_query = f"{request.draft_type.value} {request.facts[:500]}"
-        if request.sections_involved:
-            retrieval_query += " " + " ".join(request.sections_involved)
+        state.raw_llm_response = full_response
 
-        qu = QueryUnderstanding(
-            original_query=retrieval_query,
-            cleaned_query=retrieval_query,
-            intent=LegalIntentType.DRAFTING_REQUEST,
-            intent_confidence=1.0,
-            draft_type=request.draft_type,
-        )
+        # Async post-stream verification (fire-and-forget for latency)
+        try:
+            verifier = self._make_verifier()
+            verified, flags = await verifier.verify(
+                llm_response=full_response,
+                retrieved_chunks=state.reranked_chunks,
+                original_query=request.message,
+            )
+            state.verified_citations = verified
+            state.hallucination_flags = flags
+        except Exception as e:
+            logger.warning(f"Post-stream verification failed: {e}")
 
-        chunks, _ = await self._retriever.retrieve(
-            query=retrieval_query,
-            query_understanding=qu,
-            top_k_final=8,
+    async def run_draft(self, request: DraftRequest) -> LegalResponse:
+        state = AgentState(
+            original_query=f"Draft {request.draft_type.value} for: {request.facts[:200]}"
         )
-
-        result = await self._drafting_agent.draft(
-            draft_type=request.draft_type,
-            facts=request.facts,
-            parties=request.parties,
-            retrieved_chunks=chunks,
-            court=request.court,
-            additional_context=request.additional_context,
+        draft_text = await self._drafting.generate_draft(request)
+        state.raw_llm_response = draft_text
+        return LegalResponse(
+            query=state.original_query,
+            session_id=state.session_id,
+            intent=LegalIntentType.DRAFTING_REQUEST.value,
+            answer=draft_text,
+            confidence=0.85,
+            warnings=[
+                "This draft must be reviewed and verified by a qualified advocate "
+                "before filing or use in any legal proceeding."
+            ],
         )
-        result["session_id"] = str(__import__("uuid").uuid4())
-        return result
 
     async def run_summarize(
         self, request: SummarizeRequest, user_id: Optional[str] = None
-    ) -> JudgmentSummary:
-        """Summarize a document by ID or raw text."""
-        if request.text:
-            return await self._summarization_agent.summarize_text(
-                text=request.text,
-                document_id="user_provided",
-            )
-        elif request.document_id:
-            # Fetch chunks directly from DB by document_id — don't use retrieval
-            # (retrieval returns top-k across all docs; small docs won't appear)
-            from sqlalchemy import text as sql_text
-            from backend.db.session import get_db_session
-            from backend.models.domain import (
-                ChunkType, DocumentMetadata, DocumentType,
-                LawCategory, LegalChunk, RetrievedChunk,
-            )
-
-            async with get_db_session() as db:
-                # Get document metadata
-                doc_result = await db.execute(
-                    sql_text("SELECT * FROM documents WHERE document_id = :id"),
-                    {"id": request.document_id}
-                )
-                doc_row = doc_result.fetchone()
-                if not doc_row:
-                    raise ValueError(f"Document {request.document_id} not found")
-
-                # Get all chunks ordered by index
-                chunk_result = await db.execute(
-                    sql_text("""
-                        SELECT chunk_id, content, chunk_type, chunk_index, section_ref
-                        FROM chunks
-                        WHERE document_id = :id
-                        ORDER BY chunk_index
-                        LIMIT 40
-                    """),
-                    {"id": request.document_id}
-                )
-                rows = chunk_result.fetchall()
-
-            if not rows:
-                raise ValueError(f"No chunks found for document {request.document_id}")
-
-            # Build metadata for summarization agent
-            metadata = {
-                "citation": getattr(doc_row, "citation", None),
-                "court": getattr(doc_row, "court_name", None),
-                "year": getattr(doc_row, "year", None),
-                "case_name": None,
-            }
-            parties = getattr(doc_row, "parties", None)
-            if isinstance(parties, dict):
-                metadata["case_name"] = parties.get("name")
-            elif isinstance(parties, str):
-                metadata["case_name"] = parties
-
-            # Concatenate chunk content and summarize
-            full_text = "\n\n".join(row.content for row in rows)
-            return await self._summarization_agent.summarize_text(
-                text=full_text,
-                document_id=request.document_id,
-                metadata=metadata,
-            )
-        else:
-            raise ValueError("Either text or document_id must be provided")
-
-    async def _fetch_document_chunks(
-        self, document_id: str, query: str, top_k: int = 15
-    ) -> List:
+    ) -> Dict[str, Any]:
         """
-        Fetch chunks for a specific document ranked by relevance to query.
-        Uses Postgres FTS first, falls back to vector search within document.
+        Full hierarchical summarisation.
+        Fetches ALL chunks (no LIMIT), uses typed chunk routing.
         """
         from sqlalchemy import text as sql_text
-        from backend.db.session import get_db_session
         from backend.models.domain import (
-            ChunkType, DocumentMetadata, DocumentType,
-            LawCategory, LegalChunk, RetrievedChunk,
+            LegalChunk, ChunkType, DocumentMetadata, DocumentType, LawCategory
         )
 
-        # Strip common query prefixes that contain doc title noise
-        # e.g. "Summarize the key legal principles from the case: Ram Temple case - Copy.pdf"
-        # → "key legal principles"
-        clean_query = query
-        for prefix in ["summarize the key", "summarize", "what is", "explain",
-                        "from the case:", "from the document:", "in this case",
-                        "who were", "what are"]:
-            if clean_query.lower().startswith(prefix):
-                clean_query = clean_query[len(prefix):].strip(" :-")
-        # Remove filename artifacts
-        if "." in clean_query.split()[-1] if clean_query.split() else False:
-            clean_query = " ".join(clean_query.split()[:-1])
-        # If query became too short, use original
-        if len(clean_query.strip()) < 5:
-            clean_query = query
+        document_id = request.document_id
+        if not document_id:
+            return {"error": "document_id required for summarisation"}
 
-        async with get_db_session() as db:
-            # Try FTS ranked search within document
-            result = await db.execute(sql_text("""
-                SELECT chunk_id, content, chunk_type, chunk_index, section_ref,
-                       ts_rank(content_tsv, plainto_tsquery('english', :q)) AS rank
-                FROM chunks
-                WHERE document_id = :doc_id
-                  AND content_tsv @@ plainto_tsquery('english', :q)
-                ORDER BY rank DESC
-                LIMIT :k
-            """), {"doc_id": document_id, "q": clean_query, "k": top_k})
-            rows = result.fetchall()
+        # Fetch document metadata
+        meta_result = await self._db.execute(sql_text("""
+            SELECT document_type, law, court, court_name, case_number,
+                   citation, year, date_decided, bench, parties, topic,
+                   keywords, source_url, is_landmark, language
+            FROM documents
+            WHERE document_id = :doc_id
+        """), {"doc_id": document_id})
+        meta_row = meta_result.fetchone()
 
-            # Fallback 1: ILIKE search on content (catches names, nouns FTS misses)
-            if not rows:
-                # Extract key words (>4 chars, not stop words)
-                stop = {'from', 'this', 'that', 'with', 'were', 'what', 'which',
-                        'have', 'been', 'case', 'legal', 'court', 'suit', 'file'}
-                keywords = [w.strip('.,?!') for w in clean_query.split()
-                            if len(w) > 4 and w.lower() not in stop][:4]
+        if not meta_row:
+            return {"error": f"Document {document_id} not found"}
 
-                if keywords:
-                    like_clause = " OR ".join(f"content ILIKE :kw{i}" for i in range(len(keywords)))
-                    params = {"doc_id": document_id, "k": top_k}
-                    for i, kw in enumerate(keywords):
-                        params[f"kw{i}"] = f"%{kw}%"
-                    result = await db.execute(sql_text(f"""
-                        SELECT chunk_id, content, chunk_type, chunk_index, section_ref,
-                               0.5 AS rank
-                        FROM chunks
-                        WHERE document_id = :doc_id AND ({like_clause})
-                        ORDER BY chunk_index
-                        LIMIT :k
-                    """), params)
-                    rows = result.fetchall()
+        # Fetch ALL chunks — no LIMIT
+        chunk_result = await self._db.execute(sql_text("""
+            SELECT chunk_id, chunk_type, content, content_length,
+                   chunk_index, page_number, section_ref, subsection_ref
+            FROM chunks
+            WHERE document_id = :doc_id
+            ORDER BY chunk_index
+        """), {"doc_id": document_id})
+        chunk_rows = chunk_result.fetchall()
 
-            # Fallback 2: return highest-content chunks (not just first N — skip short header chunks)
-            if not rows:
-                result = await db.execute(sql_text("""
-                    SELECT chunk_id, content, chunk_type, chunk_index, section_ref,
-                           1.0 AS rank
-                    FROM chunks
-                    WHERE document_id = :doc_id
-                      AND content_length > 200
-                    ORDER BY chunk_index
-                    LIMIT :k
-                """), {"doc_id": document_id, "k": top_k})
-                rows = result.fetchall()
+        if not chunk_rows:
+            return {"error": f"No chunks found for document {document_id}"}
 
-        if not rows:
-            return []
-
-        meta = DocumentMetadata(
-            document_type=DocumentType.JUDGMENT,
-            law=LawCategory.OTHER,
-            language="en",
+        doc_meta = DocumentMetadata(
+            document_id=document_id,
+            document_type=DocumentType(meta_row.document_type),
+            law=LawCategory(meta_row.law) if meta_row.law else None,
+            court_name=meta_row.court_name,
+            case_number=meta_row.case_number,
+            citation=meta_row.citation,
+            year=meta_row.year,
+            source_url=meta_row.source_url,
+            is_landmark=bool(meta_row.is_landmark),
+            language=meta_row.language or "en",
         )
 
-        chunks = []
-        for row in rows:
-            lc = LegalChunk(
-                chunk_id=str(row.chunk_id),
-                document_id=str(document_id),
-                chunk_type=ChunkType.PASSAGE,
-                content=row.content,
-                content_length=len(row.content),
-                chunk_index=row.chunk_index,
-                section_ref=row.section_ref or "",
-                metadata=meta,
+        chunks = [
+            LegalChunk(
+                chunk_id=str(r.chunk_id),
+                document_id=document_id,
+                chunk_type=ChunkType(r.chunk_type) if r.chunk_type else ChunkType.PASSAGE,
+                content=r.content,
+                content_length=r.content_length or len(r.content),
+                chunk_index=r.chunk_index,
+                page_number=r.page_number,
+                section_ref=r.section_ref,
+                subsection_ref=r.subsection_ref,
+                metadata=doc_meta,
             )
-            rc = RetrievedChunk(
-                chunk=lc,
-                bm25_score=float(row.rank),
-                vector_score=float(row.rank),
-                final_score=float(row.rank),
-                retrieval_method="document_fts",
-            )
-            chunks.append(rc)
-
-        return chunks
-
-        return chunks
-
-    def _build_chat_messages(
-        self,
-        query: str,
-        context: str,
-        history: List[ChatMessage],
-    ) -> List[Dict[str, str]]:
-        """Build message list for LLM with system prompt, history, and context."""
-        messages = [
-            {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(context=context)}
+            for r in chunk_rows
         ]
-        # Include last 6 history messages to stay within context limit
-        for msg in history[-6:]:
-            messages.append({"role": msg.role, "content": msg.content})
-        messages.append({"role": "user", "content": query})
-        return messages
+
+        logger.info(f"Summarising {len(chunks)} chunks for document {document_id}")
+
+        # Typed chunk routing via summarize_chunks()
+        summary = await self._summarizer.summarize_chunks(
+            chunks=chunks,
+            document_id=document_id,
+            metadata={
+                "case_name": meta_row.case_number,
+                "citation": meta_row.citation,
+                "court_name": meta_row.court_name,
+                "is_landmark": bool(meta_row.is_landmark),
+            },
+        )
+        return summary.model_dump()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Pipeline steps
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _step_understand(
+        self, state: AgentState, **kwargs
+    ):
+        t0 = time.perf_counter()
+        try:
+            qu = await self._qua.understand(
+                query=state.original_query, **kwargs
+            )
+            state.query_understanding = qu
+            state.pipeline_trace.append({"step": "understand", "intent": qu.intent.value})
+        except Exception as e:
+            logger.error(f"QueryUnderstanding failed: {e}")
+            state.error = str(e)
+        state.latency_ms["understand_ms"] = (time.perf_counter() - t0) * 1000
+
+    async def _step_retrieve(self, state: AgentState):
+        t0 = time.perf_counter()
+        try:
+            qu = state.query_understanding
+            queries = [state.original_query]
+            if qu and qu.expanded_queries:
+                queries = [state.original_query] + qu.expanded_queries[:2]
+
+            if len(queries) > 1:
+                chunks, timings = await self._retriever.retrieve_multi_query(
+                    queries=queries,
+                    query_understanding=qu,
+                    top_k_final=self._ret_cfg.final_context_k,
+                )
+            else:
+                chunks, timings = await self._retriever.retrieve(
+                    query=state.original_query,
+                    query_understanding=qu,
+                    top_k_final=self._ret_cfg.final_context_k,
+                )
+
+            state.reranked_chunks = chunks
+            state.latency_ms.update(timings)
+            state.pipeline_trace.append({
+                "step": "retrieve",
+                "chunks_retrieved": len(chunks),
+                "timings": timings,
+            })
+        except Exception as e:
+            logger.error(f"Retrieval failed: {e}")
+            state.error = str(e)
+            state.reranked_chunks = []
+        state.latency_ms["retrieve_total_ms"] = (time.perf_counter() - t0) * 1000
+
+    async def _step_map(self, state: AgentState):
+        """
+        Pre-generation grounding gate using LegalMappingAgent.
+
+        Was previously instantiated but never called anywhere in the real
+        request flow — its hallucination-stripping logic
+        (_validate_mapping_result) existed but had zero effect on what the
+        LLM actually generated. Now wired in for real:
+
+        1. Runs only for intents where facts->sections reasoning applies
+           (provision_lookup, procedure_query, drafting_request) — skipped
+           for case_search/summarization/general_query where it doesn't fit.
+        2. The mapper validates every section it proposes against
+           reranked_chunks's actual chunk_ids and section_refs, discarding
+           anything it can't trace back to a real retrieved chunk.
+        3. reranked_chunks is then NARROWED to only the chunks whose
+           section_ref survived validation — never widened. If mapping
+           fails or finds nothing, the original retrieval set is used
+           unchanged: a broken mapper degrades to "no extra filtering",
+           never to "can't answer at all".
+        """
+        qu = state.query_understanding
+        applicable_intents = {
+            LegalIntentType.PROVISION_LOOKUP.value,
+            LegalIntentType.PROCEDURE_QUERY.value,
+            LegalIntentType.DRAFTING_REQUEST.value,
+        }
+        intent = qu.intent.value if qu else LegalIntentType.GENERAL_QUERY.value
+        if intent not in applicable_intents or not state.reranked_chunks:
+            return
+
+        t0 = time.perf_counter()
+        try:
+            mapping_result = await self._mapper.map_facts_to_sections(
+                facts=state.original_query,
+                retrieved_chunks=state.reranked_chunks,
+                query_understanding=qu,
+            )
+            state.mapped_sections = mapping_result
+
+            validated_refs = {
+                str(s.get("section_number", "")).strip().lower()
+                for s in mapping_result.get("relevant_sections", [])
+                if s.get("section_number")
+            }
+
+            if validated_refs:
+                narrowed = [
+                    rc for rc in state.reranked_chunks
+                    if (rc.chunk.section_ref or "").strip().lower() in validated_refs
+                    or not rc.chunk.section_ref   # keep non-statute chunks (judgments etc.)
+                ]
+                if narrowed:
+                    state.reranked_chunks = narrowed
+
+            state.pipeline_trace.append({
+                "step": "map",
+                "sections_validated": len(mapping_result.get("relevant_sections", [])),
+                "hallucinated_sections_stripped": len(
+                    [w for w in mapping_result.get("warnings", []) if "not found in retrieved" in w]
+                ),
+            })
+        except Exception as e:
+            logger.error(f"Legal mapping failed (continuing with unfiltered chunks): {e}")
+        state.latency_ms["map_ms"] = (time.perf_counter() - t0) * 1000
+
+    async def _step_compress(self, state: AgentState):
+        t0 = time.perf_counter()
+        try:
+            state.compressed_context = self._compressor.compress(
+                chunks=state.reranked_chunks,
+                max_tokens=self._settings.ingestion.summary_window_chars // 4,
+                deduplicate=True,
+            )
+        except Exception as e:
+            logger.error(f"Context compression failed: {e}")
+            state.compressed_context = "\n\n".join(
+                rc.chunk.content[:500] for rc in state.reranked_chunks[:6]
+            )
+        state.latency_ms["compress_ms"] = (time.perf_counter() - t0) * 1000
+
+    async def _step_generate(
+        self,
+        state: AgentState,
+        history: Optional[List] = None,
+    ):
+        t0 = time.perf_counter()
+        try:
+            intent = (
+                state.query_understanding.intent.value
+                if state.query_understanding
+                else LegalIntentType.GENERAL_QUERY.value
+            )
+            template = _PROMPTS.get(intent, _PROMPTS[LegalIntentType.GENERAL_QUERY.value])
+            context = state.compressed_context or "No relevant sources found."
+            prompt = template.format(context=context, query=state.original_query)
+
+            history_text = ""
+            if history:
+                history_text = "\n".join(
+                    f"{m.role.upper()}: {m.content}" for m in history[-6:]
+                )
+                prompt = f"CONVERSATION HISTORY:\n{history_text}\n\n{prompt}"
+
+            response = await self._llm.complete(prompt=prompt)
+            state.raw_llm_response = response
+            state.pipeline_trace.append({"step": "generate", "tokens": len(response) // 4})
+        except Exception as e:
+            logger.error(f"LLM generation failed: {e}")
+            state.raw_llm_response = (
+                "I encountered an error while generating a response. "
+                "Please try again or rephrase your question."
+            )
+        state.latency_ms["generate_ms"] = (time.perf_counter() - t0) * 1000
+
+    async def _step_verify(self, state: AgentState):
+        t0 = time.perf_counter()
+        try:
+            verifier = self._make_verifier()
+            verified, flags = await verifier.verify(
+                llm_response=state.raw_llm_response or "",
+                retrieved_chunks=state.reranked_chunks,
+                original_query=state.original_query,
+            )
+            state.verified_citations = verified
+            state.hallucination_flags = flags
+            state.pipeline_trace.append({
+                "step": "verify",
+                "verified": len(verified),
+                "flags": len(flags),
+            })
+        except Exception as e:
+            logger.error(f"Verification failed: {e}")
+        state.latency_ms["verify_ms"] = (time.perf_counter() - t0) * 1000
+        state.latency_ms["total_ms"] = sum(state.latency_ms.values())

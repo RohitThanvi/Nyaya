@@ -1,146 +1,209 @@
 """
-LLM abstraction layer using LiteLLM.
-Single interface for Groq, Ollama, and OpenAI.
-Supports streaming, structured outputs, and automatic retry.
+LLM Client v2 — unified interface used by all agents.
+
+complete()           — non-streaming, returns str
+complete_with_json() — non-streaming, returns parsed dict (used by QUA + LegalMapping)
+complete_messages()  — non-streaming, takes messages list directly
+stream()             — async generator, yields str tokens
+
+get_llm_client()     — module-level singleton factory (used by old agents)
 """
 import asyncio
 import json
 import logging
-import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
-
-import litellm
-from litellm import acompletion
-from tenacity import (
-    AsyncRetrying,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+import re
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from backend.config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Suppress litellm verbose logging
-litellm.suppress_debug_info = True
-litellm.set_verbose = False
+_singleton: Optional["LLMClient"] = None
+
+
+def get_llm_client() -> "LLMClient":
+    """Module-level singleton — safe for agents that call this directly."""
+    global _singleton
+    if _singleton is None:
+        _singleton = LLMClient()
+    return _singleton
 
 
 class LLMClient:
-    """
-    Unified LLM client.
-    Swap providers by changing LLM_PROVIDER env var.
-    Supports: groq | ollama | openai
-    """
-
     def __init__(self):
-        settings = get_settings().llm
-        self._settings = settings
-        self._model = self._resolve_model()
-        self._setup_provider()
+        self._cfg = get_settings().llm
+        self._client = None
 
-    def _resolve_model(self) -> str:
-        s = self._settings
-        if s.provider == "groq":
-            return f"groq/{s.groq_model}"
-        elif s.provider == "ollama":
-            return f"ollama/{s.ollama_model}"
-        elif s.provider == "openai":
-            return f"openai/{s.openai_model}"
-        else:
-            raise ValueError(f"Unknown LLM provider: {s.provider}")
+    def _get_client(self):
+        if self._client is None:
+            from openai import AsyncOpenAI
+            if self._cfg.provider == "groq":
+                self._client = AsyncOpenAI(
+                    api_key=self._cfg.groq_api_key,
+                    base_url=self._cfg.groq_base_url,
+                )
+            elif self._cfg.provider == "openai":
+                self._client = AsyncOpenAI(api_key=self._cfg.openai_api_key)
+            else:  # ollama
+                self._client = AsyncOpenAI(
+                    api_key="ollama",
+                    base_url=self._cfg.ollama_base_url + "/v1",
+                )
+        return self._client
 
-    def _setup_provider(self) -> None:
-        s = self._settings
-        if s.provider == "groq" and s.groq_api_key:
-            litellm.groq_key = s.groq_api_key
-        elif s.provider == "openai" and s.openai_api_key:
-            litellm.openai_key = s.openai_api_key
-        elif s.provider == "ollama":
-            litellm.ollama_base_url = s.ollama_base_url
+    def _model(self) -> str:
+        if self._cfg.provider == "groq":
+            return self._cfg.groq_model
+        if self._cfg.provider == "openai":
+            return self._cfg.openai_model
+        return self._cfg.ollama_model
+
+    # ── Core: messages list ────────────────────────────────────────────────
+
+    async def complete_messages(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = None,
+        max_tokens: int = None,
+        response_format: Optional[Dict] = None,
+    ) -> str:
+        """Send a messages list directly. Foundation for all other methods."""
+        temp = temperature if temperature is not None else self._cfg.temperature
+        tokens = max_tokens or self._cfg.max_tokens
+        last_exc = None
+
+        for attempt in range(self._cfg.max_retries):
+            try:
+                client = self._get_client()
+                kwargs: Dict[str, Any] = dict(
+                    model=self._model(),
+                    messages=messages,
+                    temperature=temp,
+                    max_tokens=tokens,
+                )
+                # Groq supports JSON mode — use it for reliability
+                if response_format:
+                    kwargs["response_format"] = response_format
+
+                resp = await asyncio.wait_for(
+                    client.chat.completions.create(**kwargs),
+                    timeout=self._cfg.timeout,
+                )
+                return resp.choices[0].message.content or ""
+            except asyncio.TimeoutError:
+                logger.warning(f"LLM timeout attempt {attempt + 1}")
+                last_exc = asyncio.TimeoutError()
+            except Exception as e:
+                logger.warning(f"LLM error attempt {attempt + 1}: {e}")
+                last_exc = e
+                if attempt < self._cfg.max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+
+        raise RuntimeError(f"LLM unavailable after {self._cfg.max_retries} retries: {last_exc}")
+
+    # ── complete() — simple prompt → str ──────────────────────────────────
 
     async def complete(
         self,
-        messages: List[Dict[str, str]],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        json_mode: bool = False,
+        prompt: str,
+        temperature: float = None,
+        max_tokens: int = None,
+        system: Optional[str] = None,
     ) -> str:
-        """Single completion with retry logic."""
-        t = temperature if temperature is not None else self._settings.temperature
-        mt = max_tokens or self._settings.max_tokens
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return await self.complete_messages(messages, temperature=temperature, max_tokens=max_tokens)
 
-        kwargs: Dict[str, Any] = {
-            "model": self._model,
-            "messages": messages,
-            "temperature": t,
-            "max_tokens": mt,
-            "timeout": self._settings.timeout,
-        }
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(self._settings.max_retries),
-            wait=wait_exponential(multiplier=1, min=2, max=10),
-            retry=retry_if_exception_type((Exception,)),
-            reraise=True,
-        ):
-            with attempt:
-                response = await acompletion(**kwargs)
-                return response.choices[0].message.content
-
-    async def stream(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-    ) -> AsyncGenerator[str, None]:
-        """Streaming completion for real-time UI updates."""
-        t = temperature if temperature is not None else self._settings.temperature
-        mt = max_tokens or self._settings.max_tokens
-
-        response = await acompletion(
-            model=self._model,
-            messages=messages,
-            temperature=t,
-            max_tokens=mt,
-            timeout=self._settings.timeout,
-            stream=True,
-        )
-        async for chunk in response:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
+    # ── complete_with_json() — messages list → parsed dict ─────────────────
+    # Called by QueryUnderstandingAgent and LegalMappingAgent
 
     async def complete_with_json(
         self,
         messages: List[Dict[str, str]],
-        expected_schema: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        temperature: float = 0.0,
+        max_tokens: int = 1500,
+    ) -> Dict:
         """
-        Completion that parses JSON output.
-        Falls back to extracting JSON from markdown code blocks.
+        Send messages and parse response as JSON.
+        Uses JSON mode on Groq/OpenAI when available.
+        Falls back to extracting JSON from markdown fences.
         """
-        raw = await self.complete(messages, json_mode=True)
+        # Try with JSON response_format first (Groq supports this)
         try:
-            return json.loads(raw)
+            raw = await self.complete_messages(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            # Fallback: plain completion with JSON instruction appended
+            msgs = list(messages)
+            if msgs and msgs[-1]["role"] == "user":
+                msgs[-1] = {
+                    "role": "user",
+                    "content": msgs[-1]["content"] + "\n\nRespond ONLY with valid JSON, no other text.",
+                }
+            raw = await self.complete_messages(
+                messages=msgs,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        return self._parse_json(raw)
+
+    def _parse_json(self, raw: str) -> Dict:
+        """Extract and parse JSON from LLM response, handling markdown fences."""
+        # Strip markdown fences
+        clean = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+
+        # Try direct parse
+        try:
+            return json.loads(clean)
         except json.JSONDecodeError:
-            # Try extracting from ```json ... ``` blocks
-            import re
-            match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", raw)
-            if match:
-                return json.loads(match.group(1))
-            raise ValueError(f"Could not parse JSON from LLM response: {raw[:200]}")
+            pass
 
+        # Find first { ... } block
+        start = clean.find("{")
+        end = clean.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(clean[start:end + 1])
+            except json.JSONDecodeError:
+                pass
 
-# Module-level singleton
-_llm_client: LLMClient | None = None
+        logger.warning(f"Could not parse JSON from LLM response: {raw[:200]}")
+        return {}
 
+    # ── stream() — async generator for SSE ────────────────────────────────
 
-def get_llm_client() -> LLMClient:
-    global _llm_client
-    if _llm_client is None:
-        _llm_client = LLMClient()
-    return _llm_client
+    async def stream(
+        self,
+        prompt: str,
+        temperature: float = None,
+        system: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        temp = temperature if temperature is not None else self._cfg.temperature
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        try:
+            client = self._get_client()
+            stream = await client.chat.completions.create(
+                model=self._model(),
+                messages=messages,
+                temperature=temp,
+                max_tokens=self._cfg.max_tokens,
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+        except Exception as e:
+            logger.error(f"LLM stream error: {e}")
+            yield f"\n\n[Error generating response: {str(e)}]"

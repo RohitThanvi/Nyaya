@@ -66,8 +66,8 @@ class LegalMappingAgent:
     4. Confidence scoring based on provision clarity + evidence strength
     """
 
-    def __init__(self):
-        self._llm = get_llm_client()
+    def __init__(self, llm_client=None):
+        self._llm = llm_client or get_llm_client()
 
     def _build_context_string(self, chunks: List[RetrievedChunk]) -> str:
         """Build context from retrieved chunks with chunk IDs for traceability."""

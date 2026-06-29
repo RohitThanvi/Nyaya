@@ -56,17 +56,24 @@ COURT_KEYWORDS: Dict[str, CourtType] = {
     "tribunal": CourtType.TRIBUNAL,
 }
 
+# Ordered MOST-SPECIFIC FIRST. "anticipatory bail" must be checked before
+# "bail application" — a query like "draft an anticipatory bail application"
+# contains both substrings, and dict iteration is insertion-ordered in
+# Python, so the old ordering (general before specific) always matched
+# "bail application" first and silently misclassified every anticipatory
+# bail request as a plain bail application — wrong template, wrong sections
+# (BNSS 480 instead of 482), a real product-correctness bug, not cosmetic.
 DRAFT_KEYWORDS: Dict[str, DraftType] = {
-    "bail application": DraftType.BAIL_APPLICATION,
     "anticipatory bail": DraftType.ANTICIPATORY_BAIL,
-    "legal notice": DraftType.LEGAL_NOTICE,
-    "notice": DraftType.LEGAL_NOTICE,
-    "affidavit": DraftType.AFFIDAVIT,
-    "complaint": DraftType.COMPLAINT,
+    "bail application": DraftType.BAIL_APPLICATION,
     "fir quashing": DraftType.FIR_QUASHING_PETITION,
     "quashing petition": DraftType.FIR_QUASHING_PETITION,
+    "legal notice": DraftType.LEGAL_NOTICE,
     "written statement": DraftType.WRITTEN_STATEMENT,
     "vakalatnama": DraftType.VAKALATNAMA,
+    "affidavit": DraftType.AFFIDAVIT,
+    "complaint": DraftType.COMPLAINT,
+    "notice": DraftType.LEGAL_NOTICE,
 }
 
 SYSTEM_PROMPT = """You are a legal query analyst for Indian law. 
@@ -109,8 +116,8 @@ class QueryUnderstandingAgent:
     handling complex natural language queries properly.
     """
 
-    def __init__(self):
-        self._llm = get_llm_client()
+    def __init__(self, llm_client=None):
+        self._llm = llm_client or get_llm_client()
 
     def _extract_sections_regex(self, query: str) -> List[str]:
         """Fast regex-based section number extraction."""
@@ -154,7 +161,7 @@ class QueryUnderstandingAgent:
             return {"from": min(int(y) for y in years), "to": max(int(y) for y in years)}
         return None
 
-    async def analyze(self, query: str) -> QueryUnderstanding:
+    async def understand(self, query: str, **kwargs) -> QueryUnderstanding:
         """
         Full query understanding pipeline.
         Returns QueryUnderstanding with all extracted information.

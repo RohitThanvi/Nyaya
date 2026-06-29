@@ -26,17 +26,15 @@ GOLDEN_PATH = Path(__file__).parent.parent.parent / "data/golden_set/retrieval_e
 
 async def run_evaluation():
     from backend.agents.query_understanding.agent import QueryUnderstandingAgent
-    from backend.db.session import init_db
     from backend.embeddings.service import EmbeddingService
     from backend.retrieval.bm25.retriever import BM25Retriever
     from backend.retrieval.hybrid.pipeline import HybridRetriever
     from backend.retrieval.reranker.cross_encoder import Reranker
     from backend.retrieval.vector.retriever import VectorRetriever
     from backend.db.session import get_db_session
+    from backend.utils.llm_client import get_llm_client
 
-    await init_db()
-
-    query_agent = QueryUnderstandingAgent()
+    query_agent = QueryUnderstandingAgent(llm_client=get_llm_client())
     vector_retriever = VectorRetriever()
     reranker = Reranker()
     embedding_service = EmbeddingService()
@@ -55,7 +53,7 @@ async def run_evaluation():
         t0 = time.perf_counter()
 
         # Query understanding
-        qu = await query_agent.analyze(query)
+        qu = await query_agent.understand(query)
 
         # Retrieve (using DB session)
         async with get_db_session() as db:

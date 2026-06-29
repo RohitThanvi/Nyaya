@@ -403,8 +403,8 @@ class DraftingAgent:
     Legal document drafting with template + context grounding.
     """
 
-    def __init__(self):
-        self._llm = get_llm_client()
+    def __init__(self, llm_client=None):
+        self._llm = llm_client or get_llm_client()
 
     def _get_template(self, draft_type: DraftType) -> str:
         return TEMPLATES.get(draft_type, "")

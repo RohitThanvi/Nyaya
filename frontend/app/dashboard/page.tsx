@@ -102,7 +102,7 @@ export default function DashboardPage() {
             BNS · BNSS · BSA · Supreme Court Judgments
           </div>
           <h1 className="text-5xl font-bold tracking-tight mb-4">
-            {user ? `Welcome back, ${user.full_name.split(' ')[0]}` : 'Indian Legal Research,'}{' '}
+            {user ? `Welcome back, ${user.full_name?.split(' ')[0] ?? user.email}` : 'Indian Legal Research,'}{' '}
             {!user && <span className="text-primary">Reimagined</span>}
           </h1>
           <p className="text-xl text-muted-foreground max-w-2xl mx-auto mb-8">
