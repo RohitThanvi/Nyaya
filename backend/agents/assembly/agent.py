@@ -12,12 +12,16 @@ Responsibilities:
   they exist only for VerificationAgent to check claims mechanically.
 - Builds relevant_sections and precedents lists with full Citation provenance
 - Attaches source_url + page_number to every citation for frontend linking
-- Computes confidence score from: retrieval scores + verification ratio + hallucination count
+- Computes a calibrated confidence score from retrieval quality, source
+  diversity, and verification ratio (v3 — fixed double-penalization of
+  hallucination flags and an unrealistically generous no-citation
+  baseline; see _compute_confidence). Returns a transparent breakdown
+  alongside the score, not just a bare number.
 - Adds procedural requirements for procedure_query intent
 """
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.models.domain import (
     AgentState, Citation, LegalIntentType, LegalResponse,
@@ -64,7 +68,7 @@ class AssemblyAgent:
         relevant_sections = self._build_relevant_sections(state)
         precedents = self._build_precedents(state)
         procedural = self._build_procedural(state)
-        confidence = self._compute_confidence(state)
+        confidence, confidence_breakdown = self._compute_confidence(state)
         warnings = self._build_warnings(state)
 
         # Build retrieval debug summary (always — lightweight)
@@ -97,6 +101,7 @@ class AssemblyAgent:
             procedural_requirements=procedural,
             citations=state.verified_citations,
             confidence=confidence,
+            confidence_breakdown=confidence_breakdown,
             warnings=warnings,
             hallucination_flags=state.hallucination_flags,
             latency_ms=state.latency_ms.get("total_ms"),
@@ -286,39 +291,88 @@ class AssemblyAgent:
         clean = [s.strip().replace("\n", " ") for s in steps if len(s.strip()) > 10]
         return clean[:10]
 
-    def _compute_confidence(self, state: AgentState) -> float:
+    def _compute_confidence(self, state: AgentState) -> Tuple[float, Dict[str, Any]]:
         """
         Confidence = weighted combination of:
-          - Retrieval quality (avg final_score of top-3 chunks, 0-1)
-          - Verification ratio (verified / total claims extracted)
-          - Hallucination penalty (-0.15 per flag)
+          - Retrieval quality (avg final_score of top-3 chunks, scaled down
+            when fewer than 3 chunks were actually retrieved — thin evidence
+            should never score the same as well-corroborated evidence)
+          - Source diversity (how many distinct documents back the answer —
+            five chunks from one document is weaker corroboration than
+            chunks spread across multiple independent sources)
+          - Verification ratio (verified / total claims extracted) — this is
+            now the ONLY place hallucination flags affect the score; they
+            were previously subtracted a second time via a separate penalty
+            term on top of already lowering this ratio, which silently
+            double-counted the same evidence and made flagged answers score
+            lower than the underlying signal actually justified.
+
+        Returns (score, breakdown) — the breakdown is surfaced to the user
+        via LegalResponse.confidence_breakdown so "73% confident" is never
+        an opaque number with no way to see what it's based on.
         """
-        # Retrieval quality
         top3 = state.reranked_chunks[:3]
         if top3:
             avg_retrieval = sum(rc.final_score for rc in top3) / len(top3)
-            # Normalise: reranker scores are already 0-1 after sigmoid
-            retrieval_score = min(avg_retrieval, 1.0)
+            avg_retrieval = min(avg_retrieval, 1.0)
+            # Penalize thin evidence: 1 chunk retrieved is materially less
+            # trustworthy than 3+, even if that single chunk scored well.
+            breadth_factor = min(len(top3) / 3, 1.0)
+            retrieval_score = avg_retrieval * (0.7 + 0.3 * breadth_factor)
         else:
-            retrieval_score = 0.3   # fallback with no retrieval
+            retrieval_score = 0.15  # no retrieval at all is a low-confidence signal, not a neutral one
 
-        # Verification ratio
+        unique_docs = len({
+            rc.chunk.document_id for rc in state.reranked_chunks[:5]
+        }) if state.reranked_chunks else 0
+        # 1 source = no diversity bonus, 3+ independent sources = full bonus
+        diversity_factor = min(unique_docs / 3, 1.0) if unique_docs else 0.0
+
         total_flags = len(state.hallucination_flags)
-        total_citations = len(state.verified_citations) + total_flags
-        if total_citations > 0:
-            verify_ratio = len(state.verified_citations) / total_citations
+        total_claims_checked = len(state.verified_citations) + total_flags
+        if total_claims_checked > 0:
+            verify_ratio = len(state.verified_citations) / total_claims_checked
         else:
-            verify_ratio = 0.7   # no citations → moderate confidence
-
-        # Hallucination penalty
-        hallucination_penalty = min(total_flags * 0.15, 0.45)
+            # No checkable claims were found at all (e.g. a purely
+            # conversational reply, or retrieval came back empty). This is
+            # NOT the same as "moderate confidence" — there is nothing here
+            # that was actually verified against a source, which is exactly
+            # the case a legal research tool should be most cautious about.
+            verify_ratio = 0.35
 
         confidence = (
-            0.5 * retrieval_score +
-            0.4 * verify_ratio -
-            hallucination_penalty
+            0.45 * retrieval_score +
+            0.15 * diversity_factor +
+            0.40 * verify_ratio
         )
-        return round(max(0.0, min(1.0, confidence)), 3)
+
+        # Hard ceiling, not an additive penalty: if even one hallucinated
+        # claim was caught and stripped, the underlying generation had a
+        # real defect — cap how confident we present the cleaned-up answer
+        # as being, regardless of how good the surviving claims look.
+        if total_flags > 0:
+            confidence = min(confidence, 0.6 - min(total_flags - 1, 3) * 0.05)
+
+        confidence = round(max(0.0, min(1.0, confidence)), 3)
+
+        if confidence >= 0.75:
+            band = "high"
+        elif confidence >= 0.45:
+            band = "medium"
+        else:
+            band = "low"
+
+        breakdown = {
+            "band": band,
+            "retrieval_quality": round(retrieval_score, 3),
+            "chunks_used": len(top3),
+            "source_diversity": round(diversity_factor, 3),
+            "unique_documents": unique_docs,
+            "verification_ratio": round(verify_ratio, 3),
+            "verified_claims": len(state.verified_citations),
+            "flagged_claims": total_flags,
+        }
+        return confidence, breakdown
 
     def _build_warnings(self, state: AgentState) -> List[str]:
         warnings: List[str] = []

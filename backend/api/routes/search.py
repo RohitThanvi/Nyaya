@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 
 
-@router.post("/", response_model=LegalResponse)
+@router.post("", response_model=LegalResponse)
 async def search(
     request: SearchRequest,
     pipeline: AgentPipeline = Depends(get_pipeline),

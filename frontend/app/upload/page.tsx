@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { FileUp, File, CheckCircle2, AlertCircle, X, Search, Loader2, RotateCcw, WifiOff } from 'lucide-react'
-import { chatApi } from '@/lib/api'
+import { chatApi, getErrorMessage } from '@/lib/api'
 import { uploadResumable, cancelResumableUpload, type UploadProgressInfo } from '@/lib/resumableUpload'
 import type { UploadResponse, LegalResponse } from '@/types/api'
 import { toast } from 'sonner'
@@ -93,7 +93,7 @@ export default function UploadPage() {
         setUploadState('idle')
         return
       }
-      const msg = err?.response?.data?.detail || err?.message || 'Upload failed. Please try again.'
+      const msg = getErrorMessage(err, 'Upload failed. Please try again.')
       setError(msg)
       setUploadState('error')
       toast.error(msg)

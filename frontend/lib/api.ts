@@ -19,6 +19,36 @@ const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 const API_PREFIX = '/api/v1'
 const CHUNK_SIZE = 10 * 1024 * 1024   // 10 MB per upload chunk
 
+/**
+ * Safely extract a human-readable message from an Axios/FastAPI error.
+ *
+ * FastAPI's default validation error shape (HTTP 422) is:
+ *   { "detail": [{ "loc": [...], "msg": "...", "type": "..." }, ...] }
+ * `detail` is an ARRAY, not a string. Every call site that previously did
+ * `toast.error(err?.response?.data?.detail || 'fallback')` was passing that
+ * array (or a single error object) straight into toast.error(), which
+ * expects a string/ReactNode — this is what produced the reported
+ * "client-side exception" on registration whenever validation failed
+ * (e.g. password under 8 characters), instead of a normal error toast.
+ */
+export function getErrorMessage(err: any, fallback: string): string {
+  const detail = err?.response?.data?.detail
+  if (!detail) return err?.message || fallback
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    const msgs = detail
+      .map((d) => {
+        if (typeof d === 'string') return d
+        const field = Array.isArray(d?.loc) ? d.loc[d.loc.length - 1] : undefined
+        return field ? `${field}: ${d?.msg ?? 'invalid value'}` : d?.msg
+      })
+      .filter(Boolean)
+    return msgs.length ? msgs.join('; ') : fallback
+  }
+  if (typeof detail === 'object' && detail.msg) return detail.msg
+  return fallback
+}
+
 function createApiClient(): AxiosInstance {
   const client = axios.create({
     baseURL: `${BASE_URL}${API_PREFIX}`,

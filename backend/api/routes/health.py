@@ -8,7 +8,7 @@ from backend.config.settings import get_settings
 router = APIRouter(prefix="/health", tags=["health"])
 
 
-@router.get("/")
+@router.get("")
 async def health(db: AsyncSession = Depends(get_db)):
     cfg = get_settings()
     db_ok = False

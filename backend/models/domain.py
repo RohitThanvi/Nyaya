@@ -311,6 +311,7 @@ class LegalResponse(BaseModel):
     procedural_requirements: List[str]            = Field(default_factory=list)
     citations:               List[Citation]        = Field(default_factory=list)
     confidence:              float                 = Field(ge=0.0, le=1.0)
+    confidence_breakdown:    Optional[Dict[str, Any]] = None
     warnings:                List[str]             = Field(default_factory=list)
     hallucination_flags:     List[str]             = Field(default_factory=list)
     latency_ms:              Optional[float]       = None

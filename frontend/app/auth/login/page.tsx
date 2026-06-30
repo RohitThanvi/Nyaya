@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Scale, Eye, EyeOff, Loader2 } from 'lucide-react'
-import { authApi } from '@/lib/api'
+import { authApi, getErrorMessage } from '@/lib/api'
 import { useAuthStore } from '@/lib/store'
 import { toast } from 'sonner'
 import Link from 'next/link'
@@ -21,6 +21,10 @@ export default function LoginPage() {
   const handleSubmit = async () => {
     if (!email || !password || isLoading) return
     if (mode === 'register' && !fullName) { toast.error('Please enter your full name'); return }
+    if (mode === 'register' && password.length < 8) {
+      toast.error('Password must be at least 8 characters')
+      return
+    }
     setIsLoading(true)
     try {
       if (mode === 'login') {
@@ -33,7 +37,7 @@ export default function LoginPage() {
       toast.success(`Welcome, ${user.full_name}`)
       router.push('/dashboard')
     } catch (err: any) {
-      toast.error(err?.response?.data?.detail || `${mode === 'login' ? 'Login' : 'Registration'} failed`)
+      toast.error(getErrorMessage(err, `${mode === 'login' ? 'Login' : 'Registration'} failed`))
     } finally {
       setIsLoading(false)
     }
@@ -93,6 +97,9 @@ export default function LoginPage() {
                 {showPwd ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
               </button>
             </div>
+            {mode === 'register' && (
+              <p className="text-xs text-muted-foreground mt-1">At least 8 characters</p>
+            )}
           </div>
 
           <button onClick={handleSubmit} disabled={isLoading || !email || !password}

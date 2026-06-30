@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { PenTool, Loader2, Copy, Download, AlertTriangle, CheckCircle2, ChevronDown } from 'lucide-react'
-import { draftingApi } from '@/lib/api'
+import { draftingApi, getErrorMessage } from '@/lib/api'
 import type { DraftType, DraftResponse } from '@/types/api'
 import { toast } from 'sonner'
 
@@ -89,7 +89,7 @@ export default function DraftingPage() {
       setResult(res)
       toast.success('Draft generated. Please review before use.')
     } catch (err: any) {
-      toast.error(err?.response?.data?.detail || 'Generation failed. Please try again.')
+      toast.error(getErrorMessage(err, 'Generation failed. Please try again.'))
     } finally {
       setIsGenerating(false)
     }

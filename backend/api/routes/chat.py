@@ -20,7 +20,7 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
 
 
-@router.post("/", response_model=LegalResponse)
+@router.post("", response_model=LegalResponse)
 async def chat(
     request: ChatRequest,
     pipeline: AgentPipeline = Depends(get_pipeline),

@@ -18,7 +18,7 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
 
 
-@router.get("/")
+@router.get("")
 async def list_documents(
     law: str = None,
     court: str = None,

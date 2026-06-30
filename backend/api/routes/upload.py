@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 _cfg = get_settings()
 
 
-@router.post("/", response_model=UploadResponse)
+@router.post("", response_model=UploadResponse)
 async def upload_document(
     file: UploadFile = File(...),
     source_url: Optional[str] = Form(default=None),

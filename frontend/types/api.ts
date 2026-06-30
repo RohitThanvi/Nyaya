@@ -60,6 +60,17 @@ export interface Precedent {
   relevance_score?: number
 }
 
+export interface ConfidenceBreakdown {
+  band: 'high' | 'medium' | 'low'
+  retrieval_quality: number
+  chunks_used: number
+  source_diversity: number
+  unique_documents: number
+  verification_ratio: number
+  verified_claims: number
+  flagged_claims: number
+}
+
 export interface LegalResponse {
   query: string
   session_id: string
@@ -70,6 +81,7 @@ export interface LegalResponse {
   procedural_requirements: string[]
   citations: Citation[]
   confidence: number
+  confidence_breakdown?: ConfidenceBreakdown
   warnings: string[]
   hallucination_flags: string[]
   latency_ms?: number

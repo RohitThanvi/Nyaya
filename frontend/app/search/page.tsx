@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useRef } from 'react'
 import { Search, Filter, X, BookOpen, Gavel, AlertTriangle, CheckCircle2, Clock, ChevronDown, ChevronUp } from 'lucide-react'
-import { searchApi } from '@/lib/api'
+import { searchApi, getErrorMessage } from '@/lib/api'
 import { useSearchStore } from '@/lib/store'
 import type { LegalResponse, LawCategory, RelevantSection, Precedent } from '@/types/api'
 import { toast } from 'sonner'
@@ -128,7 +128,7 @@ export default function SearchPage() {
       })
       setResult(query.trim(), result)
     } catch (err: any) {
-      toast.error(err?.response?.data?.detail || 'Search failed. Please try again.')
+      toast.error(getErrorMessage(err, 'Search failed. Please try again.'))
     } finally {
       setIsLoading(false)
       setSearching(false)

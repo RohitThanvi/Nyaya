@@ -9,7 +9,7 @@ router = APIRouter(prefix="/draft", tags=["drafting"])
 logger = logging.getLogger(__name__)
 
 
-@router.post("/", response_model=LegalResponse)
+@router.post("", response_model=LegalResponse)
 async def generate_draft(
     request: DraftRequest,
     pipeline: AgentPipeline = Depends(get_pipeline),

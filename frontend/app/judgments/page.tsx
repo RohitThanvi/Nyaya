@@ -7,7 +7,7 @@ import {
   ChevronRight, X, Hash, MessageSquare, BookOpen,
   FileUp, ChevronDown, ChevronUp, Gavel
 } from 'lucide-react'
-import { documentsApi } from '@/lib/api'
+import { documentsApi, getErrorMessage } from '@/lib/api'
 import type { Document } from '@/types/api'
 import { toast } from 'sonner'
 
@@ -30,7 +30,7 @@ function CaseModal({ doc, onClose }: { doc: Document; onClose: () => void }) {
         const data = await documentsApi.summarize(doc.document_id)
         setSummary(data)
       } catch (e: any) {
-        toast.error(e?.response?.data?.detail || 'Could not load case details')
+        toast.error(getErrorMessage(e, 'Could not load case details'))
       } finally {
         setLoading(false)
       }
