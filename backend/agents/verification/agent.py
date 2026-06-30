@@ -88,8 +88,6 @@ class VerificationAgent:
     ) -> Tuple[List[Citation], List[str]]:
         """Main entry point. Returns (verified_citations, hallucination_flags)."""
         claims = await self._extract_claims(llm_response, original_query)
-        if not claims:
-            return [], []
 
         chunk_by_short_id = {rc.chunk.chunk_id[:8]: rc for rc in retrieved_chunks}
 
@@ -103,11 +101,86 @@ class VerificationAgent:
             if flag:
                 flags.append(flag)
 
+        # Defense-in-depth: citation-pattern extraction above only catches
+        # claims shaped like "Section N ..." or a formal judgment citation.
+        # A claim with no such pattern (e.g. "the limitation period is 90
+        # days" or "this is a cognizable offence") was previously NEVER
+        # checked at all — it carried no flag and no citation, sailing
+        # through unverified and undetected. This audit asks the LLM to
+        # find any sentence asserting a specific, checkable legal fact that
+        # isn't actually backed by the retrieved source text, and reuses
+        # the same flag format AssemblyAgent already strips sentences for.
+        audit_flags = await self._audit_ungrounded_sentences(llm_response, retrieved_chunks)
+        flags.extend(audit_flags)
+
         logger.info(
-            f"Verification: {len(claims)} claims → "
-            f"{len(verified)} verified, {len(flags)} flagged"
+            f"Verification: {len(claims)} citation claims + grounding audit → "
+            f"{len(verified)} verified, {len(flags)} flagged ({len(audit_flags)} from audit)"
         )
         return verified, flags
+
+    async def _audit_ungrounded_sentences(
+        self, response_text: str, retrieved_chunks: List[RetrievedChunk],
+    ) -> List[str]:
+        """
+        Sentence-level grounding check against the actual retrieved source
+        text, independent of citation-pattern matching. Returns flag strings
+        in the same format VerificationAgent's other methods already use
+        ("X could not be verified in the knowledge base. ...") so
+        AssemblyAgent._strip_unverified_claims removes them via its existing
+        regex without needing any change there.
+        """
+        if not response_text.strip() or not retrieved_chunks:
+            return []
+
+        # Strip CHUNK tags before showing the LLM the answer to audit —
+        # they're verification scaffolding, not part of the claim text.
+        clean_answer = _CHUNK_TAG_PATTERN.sub("", response_text).strip()
+        if not clean_answer:
+            return []
+
+        sources_text = "\n\n".join(
+            f"[{i + 1}] {rc.chunk.content[:600]}"
+            for i, rc in enumerate(retrieved_chunks[:10])
+        )
+
+        prompt = f"""You are a strict fact-checking system for a legal AI assistant.
+
+Below are the SOURCES that were retrieved to answer a legal question, and the
+ANSWER that was generated from them.
+
+Find every sentence in the ANSWER that makes a specific, checkable legal
+claim (a rule, a requirement, a number, a deadline, a punishment, a
+procedural step, or a case holding) that is NOT actually supported by the
+SOURCES text. Ignore generic framing, disclaimers, or sentences that merely
+say the sources don't cover something.
+
+Return ONLY a JSON array of the exact unsupported sentences, copied verbatim
+from the ANSWER, or [] if every specific claim is supported.
+
+SOURCES:
+{sources_text}
+
+ANSWER:
+{clean_answer[:4000]}"""
+
+        try:
+            raw = await self._llm.complete(prompt=prompt, temperature=0.0, max_tokens=800)
+            import json
+            clean = re.sub(r"```(?:json)?|```", "", raw).strip()
+            items = json.loads(clean)
+            flags = []
+            for s in items:
+                if isinstance(s, str) and s.strip() and s.strip() in clean_answer:
+                    flags.append(
+                        f"{s.strip()} could not be verified in the knowledge base. "
+                        f"This claim has been removed from the answer — please check "
+                        f"the original statute."
+                    )
+            return flags
+        except Exception as e:
+            logger.warning(f"Grounding audit failed (non-fatal, continuing without it): {e}")
+            return []
 
     # ──────────────────────────────────────────────────────────────────────
     # Step 1 — Structured claim extraction

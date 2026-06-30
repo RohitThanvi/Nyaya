@@ -73,9 +73,12 @@ async def upload_document(
     tmp_path = upload_dir / f"{uuid.uuid4()}_{file.filename}"
 
     try:
-        content = await file.read()
         with open(tmp_path, "wb") as f:
-            f.write(content)
+            while True:
+                buf = await file.read(8 * 1024 * 1024)  # 8MB at a time
+                if not buf:
+                    break
+                f.write(buf)
 
         permanent_path = upload_dir / file.filename
         if permanent_path.exists():
@@ -276,14 +279,25 @@ async def upload_chunk(
 @router.post("/chunked/{upload_id}/finalise", response_model=UploadResponse)
 async def finalise_chunked_upload(
     upload_id: str,
-    db: AsyncSession = Depends(get_db),
-    embedder: EmbeddingService = Depends(get_embedding_service),
-    vector: VectorRetriever = Depends(get_vector_retriever),
+    background: bool = True,
 ):
     """
     Assemble all chunks in order and trigger ingestion.
     Verifies total assembled size matches the declared total_size before
     proceeding — catches any silent gap left by a missed chunk.
+
+    background=True (default): ingestion (parse -> embed -> index) is
+    dispatched to Celery and this call returns immediately with the
+    document_id and status="processing". This matters specifically for
+    large files: running the full pipeline synchronously inside the HTTP
+    request previously blocked a FastAPI worker for the entire duration
+    of parsing + embedding + indexing a potentially multi-GB document,
+    risking reverse-proxy/load-balancer timeouts and starving other
+    requests of workers. Poll GET /upload/document/{document_id}/status
+    for progress.
+
+    background=False: old synchronous behaviour, for small files or
+    local/dev testing where blocking is fine.
     """
     meta = _read_meta(upload_id)
     upload_dir = _chunked_dir(upload_id)
@@ -334,12 +348,47 @@ async def finalise_chunked_upload(
             final_path = final_dir / f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
         shutil.move(str(assembled_path), str(final_path))
 
-        pipeline = IngestionPipeline(db=db, embedding_service=embedder, vector_retriever=vector)
-        result = await pipeline.ingest_upload(
-            file_path=str(final_path),
-            original_filename=final_path.name,
-            source_url=meta.get("source_url"),
-        )
+        document_id = str(uuid.uuid4())
+
+        if background:
+            from celery import chain
+            from backend.ingestion.workers.tasks import parse_document, embed_document
+
+            chain(
+                parse_document.s(
+                    file_path=str(final_path),
+                    source_url=meta.get("source_url"),
+                    document_id=document_id,
+                    original_filename=final_path.name,
+                ),
+                embed_document.s(),
+            ).apply_async()
+
+            return UploadResponse(
+                document_id=document_id,
+                filename=meta["filename"],
+                pages=0,
+                chunks_created=0,
+                failed_chunk_ids=[],
+                status="processing",
+                message=(
+                    f"File received and queued for processing. "
+                    f"Poll GET /upload/document/{document_id}/status for progress."
+                ),
+            )
+
+        # Synchronous fallback path
+        from backend.db.session import get_db_session
+        from backend.api.dependencies.pipeline import get_embedding_service, get_vector_retriever
+        async with get_db_session() as db:
+            embedder = get_embedding_service()
+            vector = get_vector_retriever()
+            pipeline = IngestionPipeline(db=db, embedding_service=embedder, vector_retriever=vector)
+            result = await pipeline.ingest_upload(
+                file_path=str(final_path),
+                original_filename=final_path.name,
+                source_url=meta.get("source_url"),
+            )
 
         return UploadResponse(
             document_id=result["document_id"],
@@ -360,6 +409,65 @@ async def finalise_chunked_upload(
             shutil.rmtree(upload_dir)
         except Exception:
             pass
+
+
+@router.get("/document/{document_id}/status")
+async def document_ingestion_status(
+    document_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Poll ingestion progress for a document submitted via background=True
+    finalise. Reports each pipeline stage so the frontend can show real
+    progress instead of a stuck spinner for large files.
+    """
+    from sqlalchemy import text as sql_text
+
+    doc_row = (await db.execute(
+        sql_text("SELECT document_id, pages FROM documents WHERE document_id = :id"),
+        {"id": document_id},
+    )).fetchone()
+
+    if not doc_row:
+        return {
+            "document_id": document_id,
+            "stage": "parsing",
+            "detail": "Document not yet visible in the database — still parsing or queued.",
+        }
+
+    chunk_count = (await db.execute(
+        sql_text("SELECT COUNT(*) FROM chunks WHERE document_id = :id"),
+        {"id": document_id},
+    )).scalar_one()
+
+    staged_total = (await db.execute(
+        sql_text("SELECT COUNT(*) FROM staged_chunks WHERE document_id = :id"),
+        {"id": document_id},
+    )).scalar_one()
+
+    staged_indexed = (await db.execute(
+        sql_text("SELECT COUNT(*) FROM staged_chunks WHERE document_id = :id AND indexed = true"),
+        {"id": document_id},
+    )).scalar_one()
+
+    if chunk_count == 0:
+        stage = "parsing"
+    elif staged_total < chunk_count:
+        stage = "embedding"
+    elif staged_indexed < staged_total:
+        stage = "indexing"
+    else:
+        stage = "complete"
+
+    return {
+        "document_id": document_id,
+        "pages": doc_row.pages,
+        "chunks_parsed": chunk_count,
+        "chunks_embedded": staged_total,
+        "chunks_indexed": staged_indexed,
+        "stage": stage,
+        "complete": stage == "complete",
+    }
 
 
 @router.delete("/chunked/{upload_id}", status_code=status.HTTP_204_NO_CONTENT)
