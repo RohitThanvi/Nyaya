@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import threading
 from typing import List, Optional
 
 from backend.config.settings import get_settings
@@ -33,6 +34,7 @@ class EmbeddingService:
     _model = None
     _model_name: Optional[str] = None
     _verified_dim: Optional[int] = None
+    _load_lock = threading.Lock()
 
     def __init__(self):
         self._cfg = get_settings().embedding
@@ -41,42 +43,52 @@ class EmbeddingService:
 
     @classmethod
     def _load_model_once(cls):
-        cfg = get_settings().embedding
-        if cls._model is None or cls._model_name != cfg.model:
-            from sentence_transformers import SentenceTransformer
-            cls._model = SentenceTransformer(
-                cfg.model,
-                device=cfg.device,
-                cache_folder=cfg.cache_dir,
-            )
-            cls._model_name = cfg.model
-            cls._verified_dim = None  # force re-verification on reload
-            logger.info(f"Embedding model loaded: {cfg.model} on {cfg.device}")
+        # Fast path: model already loaded, no lock needed.
+        if cls._model is not None:
+            return cls._model
 
-            # Verify the model actually produces non-empty, correctly-sized
-            # vectors immediately after loading — fail loud here, not 3 calls later.
-            probe = cls._model.encode(
-                ["dimension verification probe"],
-                normalize_embeddings=cfg.normalize,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-            )
-            probe_dim = probe.shape[-1] if hasattr(probe, "shape") else len(probe[0]) if probe else 0
-            cls._verified_dim = probe_dim
-            logger.info(f"Embedding model verified: produces {probe_dim}-dim vectors")
-
-            expected = get_settings().qdrant.vector_size
-            if probe_dim != expected:
-                raise EmbeddingDimensionError(
-                    f"Model '{cfg.model}' produced {probe_dim}-dim vectors but "
-                    f"QDRANT_VECTOR_SIZE is configured as {expected}. "
-                    f"This usually means: (1) the installed sentence-transformers "
-                    f"version changed the model's default output behavior — pin "
-                    f"sentence-transformers==3.0.1 in requirements.txt and rebuild, or "
-                    f"(2) the model's config_sentence_transformers.json defines a "
-                    f"truncate_dim that doesn't match. Got {probe_dim}, expected {expected}."
+        with cls._load_lock:
+            # Re-check inside the lock — another thread may have finished
+            # loading while we were waiting. Without this lock, concurrent
+            # first calls (e.g. parallel document ingestion workers) could
+            # each pass the None-check before either finishes loading,
+            # double- or triple-loading the model into memory/VRAM.
+            cfg = get_settings().embedding
+            if cls._model is None or cls._model_name != cfg.model:
+                from sentence_transformers import SentenceTransformer
+                cls._model = SentenceTransformer(
+                    cfg.model,
+                    device=cfg.device,
+                    cache_folder=cfg.cache_dir,
                 )
-        return cls._model
+                cls._model_name = cfg.model
+                cls._verified_dim = None  # force re-verification on reload
+                logger.info(f"Embedding model loaded: {cfg.model} on {cfg.device}")
+
+                # Verify the model actually produces non-empty, correctly-sized
+                # vectors immediately after loading — fail loud here, not 3 calls later.
+                probe = cls._model.encode(
+                    ["dimension verification probe"],
+                    normalize_embeddings=cfg.normalize,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                )
+                probe_dim = probe.shape[-1] if hasattr(probe, "shape") else len(probe[0]) if probe else 0
+                cls._verified_dim = probe_dim
+                logger.info(f"Embedding model verified: produces {probe_dim}-dim vectors")
+
+                expected = get_settings().qdrant.vector_size
+                if probe_dim != expected:
+                    raise EmbeddingDimensionError(
+                        f"Model '{cfg.model}' produced {probe_dim}-dim vectors but "
+                        f"QDRANT_VECTOR_SIZE is configured as {expected}. "
+                        f"This usually means: (1) the installed sentence-transformers "
+                        f"version changed the model's default output behavior — pin "
+                        f"sentence-transformers==3.0.1 in requirements.txt and rebuild, or "
+                        f"(2) the model's config_sentence_transformers.json defines a "
+                        f"truncate_dim that doesn't match. Got {probe_dim}, expected {expected}."
+                    )
+            return cls._model
 
     def _get_redis(self):
         if self._redis is None:
@@ -174,7 +186,7 @@ class EmbeddingService:
         model = self._load_model_once()
         embeddings = model.encode(
             texts,
-            batch_size=self._cfg.ingest_batch_size,
+            batch_size=self._cfg.batch_size,
             normalize_embeddings=self._cfg.normalize,
             show_progress_bar=False,
             convert_to_numpy=True,

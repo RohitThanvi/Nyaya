@@ -88,10 +88,22 @@ class Reranker:
         def sigmoid(x: float) -> float:
             return 1.0 / (1.0 + math.exp(-x))
 
+        # hybrid_score comes from RRF fusion and lives in a tiny ~0-0.03
+        # range; blending it directly against a 0-1 sigmoid rerank score
+        # made the 30% hybrid weight contribute almost nothing. Min-max
+        # normalize it within this candidate set first so the blend ratio
+        # is actually meaningful.
+        hybrid_vals = [rc.hybrid_score for rc in to_rerank]
+        h_lo, h_hi = min(hybrid_vals), max(hybrid_vals)
+        h_spread = h_hi - h_lo
+
+        def _norm_hybrid(v: float) -> float:
+            return 1.0 if h_spread == 0 else (v - h_lo) / h_spread
+
         for rc, raw in zip(to_rerank, raw_scores):
             rc.rerank_score = sigmoid(float(raw))
-            # Blend: 70% reranker + 30% hybrid fusion score
-            rc.final_score = 0.7 * rc.rerank_score + 0.3 * rc.hybrid_score
+            # Blend: 70% reranker + 30% hybrid fusion score (both normalized to [0,1])
+            rc.final_score = 0.7 * rc.rerank_score + 0.3 * _norm_hybrid(rc.hybrid_score)
 
         # Exact-match items get final_score = 1.0 so they always lead
         for rc in exact:

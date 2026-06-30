@@ -47,18 +47,47 @@ LEGAL_SYNONYMS: Dict[str, List[str]] = {
 
 
 def _expand_legal_synonyms(query: str) -> str:
-    """Expand IPC/CrPC references to BNS/BNSS equivalents for better recall."""
-    expanded = query
+    """
+    Expand IPC/CrPC references to BNS/BNSS equivalents for better recall.
+
+    IMPORTANT: websearch_to_tsquery treats space-separated terms as AND.
+    Appending synonyms as plain words turned "IPC 302" into "IPC AND 302
+    AND BNS AND 103", which almost nothing matches. Synonyms must be OR'd
+    in using websearch_to_tsquery's explicit "OR" keyword instead.
+    """
+    extra_terms: List[str] = []
     for pattern, replacements in LEGAL_SYNONYMS.items():
-        if re.search(pattern, expanded, re.IGNORECASE):
-            expanded = expanded + " " + " ".join(replacements)
-    return expanded.strip()
+        if re.search(pattern, query, re.IGNORECASE):
+            extra_terms.extend(replacements)
+    if not extra_terms:
+        return query.strip()
+    # Original query stays one AND'd group; each synonym is its own OR branch.
+    or_chain = " OR ".join([f'"{query}"'] + extra_terms)
+    return or_chain.strip()
 
 
 def _normalize_section(raw: str) -> str:
     """Normalize section reference to bare number+letter: '318(2)(a)' -> '318'."""
     m = re.match(r"(\d+[A-Za-z]?)", raw.strip())
     return m.group(1) if m else raw.strip()
+
+
+def _normalize_scores(results: List["RetrievedChunk"]) -> None:
+    """
+    Min-max normalize bm25_score to [0, 1] in place, within a single tier's
+    result list. PG's ts_rank_cd lives in a tiny ~0-0.3 range while ES BM25
+    scores are unbounded (often 5-20+) — without this, merging tiers and
+    sorting on raw bm25_score lets ES silently dominate every query whenever
+    it's enabled, regardless of true relevance.
+    """
+    if not results:
+        return
+    scores = [r.bm25_score for r in results]
+    lo, hi = min(scores), max(scores)
+    spread = hi - lo
+    for r in results:
+        r.bm25_score = 1.0 if spread == 0 else (r.bm25_score - lo) / spread
+        r.final_score = r.bm25_score
 
 
 class BM25Retriever:
@@ -119,6 +148,7 @@ class BM25Retriever:
             year_to=year_to,
             document_type=document_type,
         )
+        _normalize_scores(pg_results)
         for r in pg_results:
             if r.chunk.chunk_id not in seen_ids:
                 seen_ids.add(r.chunk.chunk_id)
@@ -134,6 +164,7 @@ class BM25Retriever:
                 year_from=year_from,
                 year_to=year_to,
             )
+            _normalize_scores(es_results)
             for r in es_results:
                 if r.chunk.chunk_id not in seen_ids:
                     seen_ids.add(r.chunk.chunk_id)
@@ -256,12 +287,7 @@ class BM25Retriever:
                         c.content_tsv,
                         websearch_to_tsquery('english', :query),
                         32
-                    ) AS bm25_score,
-                    ts_headline(
-                        'english', c.content,
-                        websearch_to_tsquery('english', :query),
-                        'MaxFragments=2,MaxWords=40,MinWords=10,StartSel=<mark>,StopSel=</mark>'
-                    ) AS headline
+                    ) AS bm25_score
                 FROM chunks c
                 JOIN documents d ON c.document_id = d.document_id
                 WHERE

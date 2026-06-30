@@ -140,6 +140,7 @@ class VectorRetriever:
         chunk_ids: List[str],
         vectors: List[List[float]],
         payloads: List[Dict],
+        wait: bool = False,
     ) -> bool:
         """
         Batch upsert for ingestion flush worker.
@@ -147,6 +148,12 @@ class VectorRetriever:
         catches embedding pipeline bugs here with the exact bad index, instead
         of a generic "expected dim: 1024, got 0" from the Qdrant server with
         no indication of which chunk caused it.
+
+        wait=False by default: bulk ingestion of thousands of documents should
+        not block on synchronous index confirmation per batch — that
+        serializes what should be pipelined and tanks throughput at scale.
+        Callers that need a durability guarantee for a single critical write
+        can pass wait=True explicitly.
         """
         from qdrant_client.models import PointStruct
 
@@ -178,7 +185,7 @@ class VectorRetriever:
             await client.upsert(
                 collection_name=self._cfg.collection_name,
                 points=points,
-                wait=True,
+                wait=wait,
             )
             return True
         except Exception as e:

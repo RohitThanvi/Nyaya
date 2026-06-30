@@ -364,9 +364,6 @@ class HybridRetriever:
         if len(clean.strip()) < 5:
             clean = query
 
-        async with self._bm25._db.begin_nested() if hasattr(self._bm25._db, "begin_nested") else _null_ctx() as _:
-            pass
-
         db = self._bm25._db
 
         # FTS ranked within document
@@ -445,10 +442,3 @@ class HybridRetriever:
                 retrieval_method=RetrievalPath.DOCUMENT_FTS.value,
             ))
         return chunks
-
-
-import contextlib
-
-@contextlib.asynccontextmanager
-async def _null_ctx():
-    yield

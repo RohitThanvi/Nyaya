@@ -140,6 +140,25 @@ class IngestionPipeline:
         resume: bool = True,
         progress_callback=None,
     ) -> Dict[str, Any]:
+        """
+        Bulk-ingest every PDF in a directory with bounded concurrency.
+
+        Previously this ran fully sequentially (one document at a time),
+        despite IngestionSettings.parser_concurrency existing in config and
+        never being read anywhere. For a directory of thousands of documents
+        that serialized parsing, embedding, and DB writes that should overlap
+        — CPU-bound parsing for one file could run while another file's
+        embeddings are GPU-bound and a third is waiting on DB I/O.
+
+        Each concurrent task gets its OWN AsyncSession + IngestionPipeline:
+        AsyncSession is not safe to share across concurrently-running
+        coroutines (SQLAlchemy will raise or, worse, silently interleave
+        statements from different logical transactions on the same
+        connection). Concurrency is capped at parser_concurrency to stay
+        within the DB connection pool size.
+        """
+        from backend.db.session import get_db_session
+
         pdf_files = list(self._find_pdfs(directory, recursive))
         logger.info(f"Found {len(pdf_files)} PDF files in {directory}")
 
@@ -147,33 +166,50 @@ class IngestionPipeline:
         if resume:
             existing_ids = await self._get_indexed_filenames()
 
+        todo = [f for f in pdf_files if os.path.basename(f) not in existing_ids]
+        skipped_already_indexed = len(pdf_files) - len(todo)
+
         total_chunks = 0
         total_docs = 0
         partial_docs = 0
-        errors = []
+        errors: List[Dict[str, str]] = []
+        completed = 0
+        lock = asyncio.Lock()
 
-        for i, fpath in enumerate(pdf_files):
+        concurrency = max(1, self._cfg.parser_concurrency)
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _ingest_one(fpath: str) -> None:
+            nonlocal total_chunks, total_docs, partial_docs, completed
             fname = os.path.basename(fpath)
-            if fname in existing_ids:
-                logger.debug(f"Skipping already-indexed: {fname}")
-                continue
-            try:
-                result = await self.ingest_upload(fpath, fname)
-                total_chunks += result.get("chunks_created", 0)
-                total_docs += 1
-                if result.get("status") == "partial":
-                    partial_docs += 1
-                if progress_callback:
-                    progress_callback(i + 1, len(pdf_files), fname)
-            except Exception as e:
-                logger.error(f"Failed to ingest {fname}: {e}")
-                errors.append({"file": fname, "error": str(e)})
+            async with sem:
+                try:
+                    async with get_db_session() as db:
+                        pipeline = IngestionPipeline(db, self._embedder, self._vector)
+                        result = await pipeline.ingest_upload(fpath, fname)
+                    async with lock:
+                        total_chunks += result.get("chunks_created", 0)
+                        total_docs += 1
+                        if result.get("status") == "partial":
+                            partial_docs += 1
+                        completed += 1
+                        if progress_callback:
+                            progress_callback(completed, len(todo), fname)
+                except Exception as e:
+                    logger.error(f"Failed to ingest {fname}: {e}")
+                    async with lock:
+                        errors.append({"file": fname, "error": str(e)})
+                        completed += 1
+                        if progress_callback:
+                            progress_callback(completed, len(todo), fname)
+
+        await asyncio.gather(*(_ingest_one(f) for f in todo))
 
         return {
             "total_files": len(pdf_files),
             "ingested": total_docs,
             "partial": partial_docs,
-            "skipped": len(pdf_files) - total_docs - len(errors),
+            "skipped": skipped_already_indexed,
             "total_chunks": total_chunks,
             "errors": errors,
         }
@@ -432,13 +468,6 @@ class IngestionPipeline:
         indexed = await self._flush_staged_to_qdrant(document_id)
 
         if failed_chunk_ids:
-            try:
-                await self._db.execute(text("""
-                    UPDATE chunks SET chunk_type = chunk_type
-                    WHERE chunk_id = ANY(:ids)
-                """), {"ids": failed_chunk_ids})
-            except Exception:
-                pass
             logger.warning(
                 f"Document {document_id}: {len(failed_chunk_ids)} chunk(s) "
                 f"are in PostgreSQL (BM25-searchable) but NOT embedded — "

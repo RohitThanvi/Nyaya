@@ -153,11 +153,14 @@ class LegalChunker:
         if not parsed.raw_text or len(parsed.raw_text.strip()) < MIN_CHUNK_CHARS:
             return []
 
+        page_map: Dict[int, int] = parsed.structure.get("page_map", {}) or {}
+        sorted_offsets = sorted(page_map.keys())
+
         sentences = self._sentence_split(parsed.raw_text)
         if not sentences:
             return []
 
-        raw_chunks = self._build_chunks(sentences)
+        raw_chunks = self._build_chunks(sentences, parsed.raw_text, sorted_offsets, page_map)
         chunks = []
 
         for idx, (text, page_hint) in enumerate(raw_chunks):
@@ -190,8 +193,24 @@ class LegalChunker:
         )
         return chunks
 
+    def _page_for_offset(
+        self, offset: int, sorted_offsets: List[int], page_map: Dict[int, int]
+    ) -> Optional[int]:
+        """Binary-search the page_map for the page containing a char offset."""
+        if not sorted_offsets:
+            return None
+        import bisect
+        i = bisect.bisect_right(sorted_offsets, offset) - 1
+        if i < 0:
+            i = 0
+        return page_map.get(sorted_offsets[i])
+
     def _build_chunks(
-        self, sentences: List[str]
+        self,
+        sentences: List[str],
+        raw_text: str,
+        sorted_offsets: List[int],
+        page_map: Dict[int, int],
     ) -> List[Tuple[str, Optional[int]]]:
         """
         Sentence-window chunking with overlap AND structural-boundary
@@ -217,11 +236,25 @@ class LegalChunker:
         """
         chunks = []
         current_sents: List[str] = []
+        current_offsets: List[int] = []
         current_len = 0
 
         MIN_SECTION_CHARS = 20  # allow short but real final orders e.g. "Bail granted."
 
+        # Walk raw_text sequentially to find each sentence's char offset.
+        # Sentences are produced in document order, so a monotonically
+        # advancing cursor with str.find is both correct and O(n) overall
+        # (no re-scanning from the start for each sentence).
+        cursor = 0
+        sent_offsets: List[int] = []
         for sent in sentences:
+            pos = raw_text.find(sent.strip()[:80], cursor) if sent.strip() else -1
+            if pos == -1:
+                pos = cursor  # fallback: best-effort, keeps offsets monotonic
+            sent_offsets.append(pos)
+            cursor = pos + len(sent)
+
+        for sent, sent_offset in zip(sentences, sent_offsets):
             sent_len = len(sent)
             starts_new_section = self._is_section_boundary(sent)
 
@@ -232,24 +265,31 @@ class LegalChunker:
 
             if should_split_for_size or should_split_for_structure:
                 text = " ".join(current_sents)
-                chunks.append((text, None))
+                chunk_start = current_offsets[0] if current_offsets else sent_offset
+                page_hint = self._page_for_offset(chunk_start, sorted_offsets, page_map)
+                chunks.append((text, page_hint))
                 if should_split_for_size:
                     # Size-driven split: carry overlap sentences for context continuity
-                    overlap_buffer = current_sents[-OVERLAP_SENTENCES:]
-                    current_sents = list(overlap_buffer)
+                    overlap_n = OVERLAP_SENTENCES
+                    current_sents = current_sents[-overlap_n:]
+                    current_offsets = current_offsets[-overlap_n:]
                     current_len = sum(len(s) for s in current_sents)
                 else:
                     # Structure-driven split: no overlap — the new section is a
                     # genuinely distinct unit (FACTS vs FINAL_ORDER should never
                     # share sentences, that would mislabel both)
                     current_sents = []
+                    current_offsets = []
                     current_len = 0
 
             current_sents.append(sent)
+            current_offsets.append(sent_offset)
             current_len += sent_len
 
         if current_sents and current_len >= MIN_SECTION_CHARS:
-            chunks.append((" ".join(current_sents), None))
+            chunk_start = current_offsets[0] if current_offsets else 0
+            page_hint = self._page_for_offset(chunk_start, sorted_offsets, page_map)
+            chunks.append((" ".join(current_sents), page_hint))
 
         return chunks
 
