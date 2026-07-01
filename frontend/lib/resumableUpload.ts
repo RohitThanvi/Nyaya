@@ -393,17 +393,82 @@ async function _finalise(
   uploadId: string, fileSize: number,
   report: (info: Partial<UploadProgressInfo>) => void,
 ): Promise<UploadResponse> {
-  report({ phase: 'indexing', percent: 95, bytesUploaded: fileSize, bytesTotal: fileSize,
-            message: 'Parsing, chunking and embedding…' })
+  report({ phase: 'finalising', percent: 92, bytesUploaded: fileSize, bytesTotal: fileSize,
+            message: 'Verifying and assembling…' })
 
   const res = await axios.post<UploadResponse>(
     `${BASE_URL}${API_PREFIX}/upload/chunked/${uploadId}/finalise`,
     {},
-    { headers: _authHeaders(), timeout: 600000 },   // indexing can take minutes for large files
+    { headers: _authHeaders(), timeout: 60000 },
   )
 
-  report({ phase: 'ready', percent: 100, message: res.data.message })
+  // Background mode: server queued the ingestion job and returned immediately
+  // with status:'processing' and a trackable document_id. Poll until done.
+  if (res.data.status === 'processing' && res.data.document_id) {
+    return _pollIngestionStatus(res.data, fileSize, report)
+  }
+
+  report({ phase: 'ready', percent: 100, message: res.data.message || 'Indexed.' })
   return res.data
+}
+
+async function _pollIngestionStatus(
+  initial: UploadResponse,
+  fileSize: number,
+  report: (info: Partial<UploadProgressInfo>) => void,
+): Promise<UploadResponse> {
+  const POLL_INTERVAL_MS = 3000
+  const MAX_POLLS = 200   // 10 minutes max
+
+  const stageMessages: Record<string, string> = {
+    parsing:   'Parsing document and extracting text…',
+    embedding: 'Generating embeddings…',
+    indexing:  'Writing to vector index…',
+    complete:  'Indexed successfully.',
+  }
+
+  for (let i = 0; i < MAX_POLLS; i++) {
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS))
+    try {
+      const statusRes = await axios.get(
+        `${BASE_URL}${API_PREFIX}/upload/document/${initial.document_id}/status`,
+        { headers: _authHeaders(), timeout: 10000 },
+      )
+      const s = statusRes.data
+      const stage: string = s.stage || 'parsing'
+      const percent = stage === 'complete' ? 100
+        : stage === 'indexing' ? 95
+        : stage === 'embedding' ? 80
+        : 65
+
+      report({
+        phase: stage === 'complete' ? 'ready' : 'indexing',
+        percent,
+        bytesUploaded: fileSize,
+        bytesTotal: fileSize,
+        message: stageMessages[stage] || `Processing (${stage})…`,
+      })
+
+      if (s.complete) {
+        return {
+          ...initial,
+          pages: s.pages ?? 0,
+          chunks_created: s.chunks_parsed ?? 0,
+          status: 'success',
+          message: 'Document indexed and ready for search.',
+        }
+      }
+    } catch {
+      // Transient poll failure — keep trying
+    }
+  }
+
+  // Timed out — return what we know, the doc will be searchable eventually
+  return {
+    ...initial,
+    status: 'processing',
+    message: 'Indexing is taking longer than expected. The document will be available for search shortly.',
+  }
 }
 
 /** Explicitly cancel and discard an in-progress or resumable upload session. */

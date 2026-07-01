@@ -114,8 +114,16 @@ function ChatContent() {
         stream: true,
       },
       (token) => appendStreamToken(token),
-      () => commitStreamedMessage(),
-      (err) => { toast.error(`Chat error: ${err}`); commitStreamedMessage() }
+      () => {
+        commitStreamedMessage()
+        setStreaming(false)
+      },
+      (err) => {
+        // Don't commit a partial/error stream as a message — just reset state
+        // and show a toast so the user can retry cleanly.
+        setStreaming(false)
+        toast.error(`Chat error: ${err}`)
+      }
     )
   }, [input, isStreaming, messages, sessionId, lawFilter, documentId,
     addMessage, setStreaming, appendStreamToken, commitStreamedMessage])

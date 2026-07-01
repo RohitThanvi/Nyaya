@@ -281,15 +281,28 @@ class AgentPipeline:
         )
         draft_text = await self._drafting.generate_draft(request)
         state.raw_llm_response = draft_text
+        draft_confidence = 0.45
         return LegalResponse(
             query=state.original_query,
             session_id=state.session_id,
             intent=LegalIntentType.DRAFTING_REQUEST.value,
             answer=draft_text,
-            confidence=0.85,
+            confidence=draft_confidence,
+            confidence_breakdown={
+                "band": "medium",
+                "retrieval_quality": 0.0,
+                "chunks_used": 0,
+                "source_diversity": 0.0,
+                "unique_documents": 0,
+                "verification_ratio": 0.0,
+                "verified_claims": 0,
+                "flagged_claims": 0,
+            },
             warnings=[
                 "This draft must be reviewed and verified by a qualified advocate "
-                "before filing or use in any legal proceeding."
+                "before filing or use in any legal proceeding.",
+                "Confidence score reflects that no source verification was performed "
+                "on this draft — advocate review is mandatory.",
             ],
         )
 
@@ -566,4 +579,7 @@ class AgentPipeline:
         except Exception as e:
             logger.error(f"Verification failed: {e}")
         state.latency_ms["verify_ms"] = (time.perf_counter() - t0) * 1000
-        state.latency_ms["total_ms"] = sum(state.latency_ms.values())
+        state.latency_ms["total_ms"] = sum(
+            v for k, v in state.latency_ms.items()
+            if k not in {"total_ms", "retrieve_total_ms"}
+        )

@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from backend.config.settings import get_settings
@@ -19,13 +20,16 @@ from backend.config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 _singleton: Optional["LLMClient"] = None
+_singleton_lock = threading.Lock()
 
 
 def get_llm_client() -> "LLMClient":
-    """Module-level singleton — safe for agents that call this directly."""
+    """Module-level singleton — thread-safe for concurrent Celery workers."""
     global _singleton
     if _singleton is None:
-        _singleton = LLMClient()
+        with _singleton_lock:
+            if _singleton is None:
+                _singleton = LLMClient()
     return _singleton
 
 
@@ -191,19 +195,35 @@ class LLMClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        try:
-            client = self._get_client()
-            stream = await client.chat.completions.create(
-                model=self._model(),
-                messages=messages,
-                temperature=temp,
-                max_tokens=self._cfg.max_tokens,
-                stream=True,
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
-        except Exception as e:
-            logger.error(f"LLM stream error: {e}")
-            yield f"\n\n[Error generating response: {str(e)}]"
+        last_exc = None
+        for attempt in range(self._cfg.max_retries):
+            try:
+                client = self._get_client()
+                stream = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=self._model(),
+                        messages=messages,
+                        temperature=temp,
+                        max_tokens=self._cfg.max_tokens,
+                        stream=True,
+                    ),
+                    timeout=self._cfg.timeout,
+                )
+                async for chunk in stream:
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        yield delta
+                return  # clean exit
+            except asyncio.TimeoutError:
+                last_exc = asyncio.TimeoutError("LLM stream timed out")
+                logger.warning(f"LLM stream timeout attempt {attempt + 1}")
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"LLM stream error attempt {attempt + 1}: {e}")
+
+            if attempt < self._cfg.max_retries - 1:
+                backoff = min(2 ** attempt, 30)
+                await asyncio.sleep(backoff)
+
+        logger.error(f"LLM stream failed after {self._cfg.max_retries} retries: {last_exc}")
+        yield f"\n\n[Response unavailable — please retry. Error: {last_exc}]"

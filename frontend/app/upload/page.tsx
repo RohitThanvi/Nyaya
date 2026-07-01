@@ -85,6 +85,8 @@ export default function UploadPage() {
           `Indexed ${result.chunks_created} chunks, but ${result.failed_chunk_ids.length} ` +
           `failed embedding and won't appear in semantic search. Text search still works for them.`
         )
+      } else if (result.status === 'processing') {
+        toast.info('Document uploaded. Indexing is running in the background — it will be ready for search shortly.')
       } else {
         toast.success(`Indexed ${result.chunks_created} chunks from ${result.pages} pages`)
       }
@@ -291,13 +293,21 @@ export default function UploadPage() {
                 <div>
                   <p className="font-medium text-sm mb-1">{uploadResult.filename}</p>
                   <div className="flex items-center gap-3 text-xs text-muted-foreground flex-wrap">
-                    <span>{uploadResult.pages} pages</span>
-                    <span>·</span>
-                    <span>{uploadResult.chunks_created} searchable chunks</span>
+                    {uploadResult.pages > 0 && <span>{uploadResult.pages} pages</span>}
+                    {uploadResult.pages > 0 && <span>·</span>}
+                    {uploadResult.chunks_created > 0
+                      ? <span>{uploadResult.chunks_created} searchable chunks</span>
+                      : <span className="text-primary">Indexing in background…</span>
+                    }
                     {uploadResult.status === 'partial' ? (
                       <>
                         <span>·</span>
                         <span className="text-amber-400">{uploadResult.failed_chunk_ids.length} chunk(s) not embedded</span>
+                      </>
+                    ) : uploadResult.status === 'processing' ? (
+                      <>
+                        <span>·</span>
+                        <span className="text-primary">Will be searchable shortly</span>
                       </>
                     ) : (
                       <>
