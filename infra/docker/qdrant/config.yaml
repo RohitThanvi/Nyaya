@@ -1,8 +1,31 @@
 storage:
   storage_path: /qdrant/storage
+  # Keep everything in RAM — 512GB system RAM is far larger than the index.
+  # on_disk_payload: false means chunk text + metadata stays in RAM, not mmap'd.
+  # This eliminates disk I/O latency on payload retrieval during reranking.
+  on_disk_payload: false
+  # performance_config: raise mmap threshold so vectors are loaded into RAM
+  # pages instead of being memory-mapped from disk.
+  performance:
+    max_search_threads: 0    # 0 = use all available CPU cores for parallel search
+    max_optimization_threads: 2
 
 service:
-  max_request_size_mb: 256
-  max_workers: 0
+  max_request_size_mb: 512   # large enough for batch upserts of 50K chunks
+  max_workers: 0             # 0 = auto, scales to available CPU cores
+  # gRPC port for high-throughput batch ingestion (faster than HTTP for large payloads)
+  grpc_port: 6334
+  enable_tls: false
 
 log_level: INFO
+
+# Optimizer settings — controls when Qdrant rebuilds HNSW segments
+optimizers:
+  # Only build HNSW index once 100K vectors are staged in a segment.
+  # Avoids repeatedly rebuilding the index during bulk ingestion
+  # (was: 10K default, which triggered 10x more rebuilds during bulk load).
+  indexing_threshold_kb: 102400   # 100MB of raw vectors before indexing
+  # Flush unindexed vectors to disk frequently to avoid memory pressure
+  # during large bulk ingestion jobs.
+  flush_interval_sec: 5
+  max_segment_size_kb: 5242880    # 5GB max segment size

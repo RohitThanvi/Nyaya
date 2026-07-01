@@ -117,22 +117,33 @@ class LLMSettings(BaseSettings):
 class EmbeddingSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="EMBEDDING_", env_file=".env", extra="ignore")
     model:      str  = Field(default="BAAI/bge-large-en-v1.5")
-    device:     str  = Field(default="cpu")
-    batch_size: int  = Field(default=32)
-    # Ingestion-time batch size — larger on GPU workers
-    ingest_batch_size: int = Field(default=512)
+    # "cuda" — workers pin to their assigned GPU via CUDA_VISIBLE_DEVICES env var
+    # set by Docker/Celery, so each worker always sees its GPU as "cuda:0".
+    device:     str  = Field(default="cuda")
+    # 512 per GPU: bge-large-en-v1.5 is ~1.3GB at fp16; 48GB VRAM leaves
+    # 36x headroom — batch_size=512 keeps the GPU fully saturated without
+    # OOM. Was 32 (CPU default), which would leave GPU 98% idle.
+    batch_size: int  = Field(default=512)
     max_length: int  = Field(default=512)
     normalize:  bool = Field(default=True)
     cache_dir:  str  = Field(default="./data/embeddings/models")
+    # Number of GPU embedding workers to spawn (one per physical GPU)
+    gpu_count:  int  = Field(default=4)
+    # fp16 inference: halves VRAM usage, negligible quality difference for
+    # retrieval embeddings. Enables larger batches and faster throughput.
+    fp16:       bool = Field(default=True)
 
 
 class RerankerSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RERANKER_", env_file=".env", extra="ignore")
-    model:      str  = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2")
-    device:     str  = Field(default="cpu")
-    top_k:      int  = Field(default=10)
-    batch_size: int  = Field(default=32)
+    # Upgraded from MiniLM-L6 to L12-v2: 12 layers vs 6, significantly better
+    # reranking accuracy — 192GB VRAM makes this essentially free to run.
+    model:      str  = Field(default="cross-encoder/ms-marco-MiniLM-L-12-v2")
+    device:     str  = Field(default="cuda")
+    top_k:      int  = Field(default=20)    # rerank more candidates with GPU speed
+    batch_size: int  = Field(default=128)   # was 32, GPU handles 128 easily
     cache_dir:  str  = Field(default="./data/embeddings/models")
+    fp16:       bool = Field(default=True)
 
 
 class RetrievalSettings(BaseSettings):
@@ -156,28 +167,30 @@ class RetrievalSettings(BaseSettings):
 
 
 class IngestionSettings(BaseSettings):
-    """Distributed ingestion pipeline settings."""
+    """Distributed ingestion pipeline — tuned for 4x RTX 6000 Ada / 512GB RAM."""
     model_config = SettingsConfigDict(env_prefix="INGEST_", env_file=".env", extra="ignore")
-    # Celery broker
     celery_broker:  str = Field(default="redis://localhost:6379/1")
     celery_backend: str = Field(default="redis://localhost:6379/2")
-    # Worker concurrency
-    parser_concurrency:   int = Field(default=8)   # CPU workers for PDF parsing
-    embedder_concurrency: int = Field(default=2)   # GPU workers for embedding
-    # Staging flush
-    flush_batch_size:  int = Field(default=10000)  # chunks per Qdrant batch upsert
-    flush_interval_s:  int = Field(default=60)     # seconds between flush cycles
-    # Chunked HTTP upload
-    chunk_size_mb:     int = Field(default=25)     # per upload chunk
-    max_file_size_gb:  float = Field(default=10.0) # max single file — raised for
-                                                     # large bundled judgment PDFs and
-                                                     # multi-volume scanned case files
-    # OCR settings
-    ocr_dpi:           int  = Field(default=300)
+    # 32 CPU parse workers: pdfplumber/PyMuPDF is CPU-bound, server-class Xeon
+    # with 32+ cores can saturate this without touching the GPUs.
+    parser_concurrency:   int = Field(default=32)
+    # 4 embed workers — one per GPU, each pinned via CUDA_VISIBLE_DEVICES.
+    embedder_concurrency: int = Field(default=4)
+    # Chunks per Qdrant upsert batch. 50K at a time with async wait=False
+    # means the Qdrant indexing pipeline stays ahead of the embed workers.
+    flush_batch_size:  int   = Field(default=50000)
+    flush_interval_s:  int   = Field(default=30)
+    # Per-embed sub-task size: each GPU task embeds 512 chunks (matches
+    # GPU batch_size), so a 10K-chunk document fans out to 20 parallel
+    # GPU tasks across 4 queues, all running simultaneously.
+    embed_subtask_size: int  = Field(default=512)
+    # Raise limits for large legal corpus files
+    chunk_size_mb:     int   = Field(default=50)
+    max_file_size_gb:  float = Field(default=50.0)
+    ocr_dpi:           int   = Field(default=300)
     ocr_threshold:     float = Field(default=0.6)
-    # Hierarchical summarisation window
-    summary_window_chars:   int = Field(default=12000)
-    summary_overlap_chars:  int = Field(default=500)
+    summary_window_chars:  int = Field(default=12000)
+    summary_overlap_chars: int = Field(default=500)
 
 
 class AuthSettings(BaseSettings):

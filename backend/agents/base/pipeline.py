@@ -200,6 +200,37 @@ class AgentPipeline:
             user_id=user_id,
         )
 
+        # Semantic cache check — skip for document-scoped queries (those are
+        # already fast since they target one document's chunk set) and for
+        # queries with explicit history (cache should not collapse multi-turn
+        # conversation into a single-turn cached answer).
+        _cache = None
+        _query_embedding: Optional[List[float]] = None
+        if not request.document_id and not request.history:
+            try:
+                from backend.utils.redis_client import get_redis_client
+                from backend.utils.semantic_cache import SemanticCache
+                redis = await get_redis_client()
+                _cache = SemanticCache(redis)
+                _query_embedding = await self._embedder.embed_query(request.message)
+                cached = await _cache.get(
+                    _query_embedding,
+                    law_filter=[f.value if hasattr(f, "value") else f
+                                for f in (request.law_filter or [])],
+                )
+                if cached:
+                    logger.info(
+                        f"SemanticCache HIT (sim={cached.get('_cache_similarity', '?')}) "
+                        f"for query: {request.message[:80]}"
+                    )
+                    from backend.models.domain import LegalResponse as LR
+                    cached.pop("_cache_hit", None)
+                    cached.pop("_cache_similarity", None)
+                    return LR(**cached)
+            except Exception as e:
+                logger.warning(f"Semantic cache lookup failed (continuing without cache): {e}")
+                _cache = None
+
         # Document-scoped retrieval
         if request.document_id:
             t0 = time.perf_counter()
@@ -218,7 +249,22 @@ class AgentPipeline:
         await self._step_compress(state)
         await self._step_generate(state, history=request.history)
         await self._step_verify(state)
-        return self._assembler.assemble(state)
+        result = self._assembler.assemble(state)
+
+        # Store in semantic cache for future identical/near-identical queries
+        if _cache and _query_embedding and not request.document_id:
+            try:
+                await _cache.set(
+                    query_embedding=_query_embedding,
+                    law_filter=[f.value if hasattr(f, "value") else f
+                                for f in (request.law_filter or [])],
+                    query_text=request.message,
+                    result=result.model_dump(),
+                )
+            except Exception as e:
+                logger.warning(f"Semantic cache store failed (non-fatal): {e}")
+
+        return result
 
     async def run_chat_stream(
         self, request: ChatRequest, user_id: Optional[str] = None

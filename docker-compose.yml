@@ -1,18 +1,25 @@
+# NyayaAI — Production docker-compose
+# Hardware: 4× RTX 6000 Ada (48GB each), 512GB RAM, 27.1TB NVMe
+
 services:
 
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16
     environment:
-      POSTGRES_DB: ${DB_NAME:-nyaya_ai}
-      POSTGRES_USER: ${DB_USER:-nyaya_user}
+      POSTGRES_DB:       ${DB_NAME:-nyaya_ai}
+      POSTGRES_USER:     ${DB_USER:-nyaya_user}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-nyaya_pass}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/docker/postgres/init.sql:/docker-entrypoint-initdb.d/00_extensions.sql
       - ./backend/db/migrations/0001_initial.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - ./infra/docker/postgres/postgresql.conf:/etc/postgresql/postgresql.conf
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
     ports:
       - "5432:5432"
+    shm_size: '256mb'           # needed for parallel query workers
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-nyaya_user} -d ${DB_NAME:-nyaya_ai}"]
       interval: 10s
@@ -25,7 +32,6 @@ services:
     image: qdrant/qdrant:v1.7.4
     volumes:
       - qdrant_data:/qdrant/storage
-      # config mounted directly to the path Qdrant v1.7.x reads at startup
       - ./infra/docker/qdrant/config.yaml:/qdrant/config/config.yaml
     ports:
       - "6333:6333"
@@ -34,8 +40,10 @@ services:
       QDRANT__SERVICE__GRPC_PORT: "6334"
       QDRANT__SERVICE__HTTP_PORT: "6333"
       QDRANT__LOG_LEVEL: "INFO"
+      QDRANT__STORAGE__ON_DISK_PAYLOAD: "false"    # keep payloads in 512GB RAM
+    # Give Qdrant access to as much RAM as it needs — 300GB budget for vectors+payloads
+    mem_limit: 300g
     healthcheck:
-      # Pure TCP check — Qdrant image has no curl/wget
       test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/6333' && exit 0 || exit 1"]
       interval: 10s
       timeout: 5s
@@ -52,6 +60,7 @@ services:
       - ./infra/docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
     ports:
       - "6379:6379"
+    mem_limit: 34g
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -66,26 +75,30 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST: postgres
-      DB_PORT: 5432
-      QDRANT_HOST: qdrant
-      QDRANT_PORT: 6333
-      QDRANT_GRPC_PORT: 6334
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      PYTHONPATH: /app
+      DB_HOST:            postgres
+      QDRANT_HOST:        qdrant
+      REDIS_HOST:         redis
+      PYTHONPATH:         /app
+      EMBEDDING_DEVICE:   cuda
+      EMBEDDING_BATCH_SIZE: 512
+      EMBEDDING_FP16:     "true"
     volumes:
       - ./data:/app/data
       - model_cache:/app/data/embeddings/models
     ports:
       - "8000:8000"
+    # Backend uses GPU for real-time query embedding (embed_query is ~5ms on GPU)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]         # query embedding on GPU 0
+              capabilities: [gpu]
     depends_on:
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
+      qdrant:   { condition: service_healthy }
+      redis:    { condition: service_healthy }
     restart: unless-stopped
 
   # ── Frontend (Next.js) ───────────────────────────────────────────────────────
@@ -97,97 +110,246 @@ services:
       NEXT_PUBLIC_API_URL: http://localhost:8000
     ports:
       - "3000:3000"
-    depends_on:
-      - backend
+    depends_on: [backend]
     restart: unless-stopped
 
-  # ── Nginx reverse proxy ──────────────────────────────────────────────────────
+  # ── Nginx ────────────────────────────────────────────────────────────────────
   nginx:
     image: nginx:alpine
     volumes:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "80:80"
-    depends_on:
-      - backend
-      - frontend
+    depends_on: [backend, frontend]
     restart: unless-stopped
 
-  # ── Optional services — uncomment to enable ──────────────────────────────────
-  #
-  # Celery parse worker (CPU — bulk PDF ingestion)
-  # celery-parser:
-  #   build:
-  #     context: .
-  #     dockerfile: backend/Dockerfile
-  #   env_file: .env
-  #   environment:
-  #     DB_HOST: postgres
-  #     QDRANT_HOST: qdrant
-  #     REDIS_HOST: redis
-  #     PYTHONPATH: /app
-  #   command: >
-  #     celery -A backend.ingestion.workers.celery_app worker
-  #     -Q nyaya_parse -c 8 --loglevel=info -n parser@%h
-  #   volumes:
-  #     - ./data:/app/data
-  #   depends_on:
-  #     - postgres
-  #     - redis
-  #
-  # Celery embed worker (GPU recommended)
-  # celery-embedder:
-  #   build:
-  #     context: .
-  #     dockerfile: backend/Dockerfile
-  #   env_file: .env
-  #   environment:
-  #     DB_HOST: postgres
-  #     QDRANT_HOST: qdrant
-  #     REDIS_HOST: redis
-  #     PYTHONPATH: /app
-  #     EMBEDDING_DEVICE: cpu
-  #   command: >
-  #     celery -A backend.ingestion.workers.celery_app worker
-  #     -Q nyaya_embed -c 2 --loglevel=info -n embedder@%h
-  #   volumes:
-  #     - ./data:/app/data
-  #     - model_cache:/app/data/embeddings/models
-  #   depends_on:
-  #     - postgres
-  #     - redis
-  #
-  # Celery Beat scheduler (runs flush_staged every 60s)
-  # celery-beat:
-  #   build:
-  #     context: .
-  #     dockerfile: backend/Dockerfile
-  #   env_file: .env
-  #   environment:
-  #     DB_HOST: postgres
-  #     REDIS_HOST: redis
-  #     PYTHONPATH: /app
-  #   command: >
-  #     celery -A backend.ingestion.workers.celery_app beat
-  #     --loglevel=info
-  #   depends_on:
-  #     - redis
-  #
-  # Elasticsearch (TB-scale BM25 — also set ES_ENABLED=true in .env)
-  # elasticsearch:
-  #   image: elasticsearch:8.13.0
-  #   environment:
-  #     - discovery.type=single-node
-  #     - ES_JAVA_OPTS=-Xms2g -Xmx2g
-  #     - xpack.security.enabled=false
-  #   volumes:
-  #     - es_data:/usr/share/elasticsearch/data
-  #   ports:
-  #     - "9200:9200"
+  # ── Celery: CPU parse workers (32 concurrent) ────────────────────────────────
+  celery-parser:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST:     postgres
+      QDRANT_HOST: qdrant
+      REDIS_HOST:  redis
+      PYTHONPATH:  /app
+    command: >
+      celery -A backend.ingestion.workers.celery_app worker
+      -Q nyaya_parse -c 32 --loglevel=info -n parser@%h
+      --max-tasks-per-child=1000
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  # ── Celery: GPU embed workers — one per GPU ───────────────────────────────────
+  celery-embed-gpu0:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST:              postgres
+      QDRANT_HOST:          qdrant
+      REDIS_HOST:           redis
+      PYTHONPATH:           /app
+      CUDA_VISIBLE_DEVICES: "0"
+      EMBEDDING_DEVICE:     cuda
+      EMBEDDING_BATCH_SIZE: "512"
+      EMBEDDING_FP16:       "true"
+    command: >
+      celery -A backend.ingestion.workers.celery_app worker
+      -Q nyaya_embed_gpu_0 -c 1 --loglevel=info -n embed_gpu0@%h
+      --max-tasks-per-child=500
+    volumes:
+      - ./data:/app/data
+      - model_cache:/app/data/embeddings/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  celery-embed-gpu1:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST:              postgres
+      QDRANT_HOST:          qdrant
+      REDIS_HOST:           redis
+      PYTHONPATH:           /app
+      CUDA_VISIBLE_DEVICES: "1"
+      EMBEDDING_DEVICE:     cuda
+      EMBEDDING_BATCH_SIZE: "512"
+      EMBEDDING_FP16:       "true"
+    command: >
+      celery -A backend.ingestion.workers.celery_app worker
+      -Q nyaya_embed_gpu_1 -c 1 --loglevel=info -n embed_gpu1@%h
+      --max-tasks-per-child=500
+    volumes:
+      - ./data:/app/data
+      - model_cache:/app/data/embeddings/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  celery-embed-gpu2:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST:              postgres
+      QDRANT_HOST:          qdrant
+      REDIS_HOST:           redis
+      PYTHONPATH:           /app
+      CUDA_VISIBLE_DEVICES: "2"
+      EMBEDDING_DEVICE:     cuda
+      EMBEDDING_BATCH_SIZE: "512"
+      EMBEDDING_FP16:       "true"
+    command: >
+      celery -A backend.ingestion.workers.celery_app worker
+      -Q nyaya_embed_gpu_2 -c 1 --loglevel=info -n embed_gpu2@%h
+      --max-tasks-per-child=500
+    volumes:
+      - ./data:/app/data
+      - model_cache:/app/data/embeddings/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2"]
+              capabilities: [gpu]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  celery-embed-gpu3:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST:              postgres
+      QDRANT_HOST:          qdrant
+      REDIS_HOST:           redis
+      PYTHONPATH:           /app
+      CUDA_VISIBLE_DEVICES: "3"
+      EMBEDDING_DEVICE:     cuda
+      EMBEDDING_BATCH_SIZE: "512"
+      EMBEDDING_FP16:       "true"
+    command: >
+      celery -A backend.ingestion.workers.celery_app worker
+      -Q nyaya_embed_gpu_3 -c 1 --loglevel=info -n embed_gpu3@%h
+      --max-tasks-per-child=500
+    volumes:
+      - ./data:/app/data
+      - model_cache:/app/data/embeddings/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["3"]
+              capabilities: [gpu]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  # ── Celery: Qdrant flush worker ───────────────────────────────────────────────
+  celery-flush:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST:     postgres
+      QDRANT_HOST: qdrant
+      REDIS_HOST:  redis
+      PYTHONPATH:  /app
+    command: >
+      celery -A backend.ingestion.workers.celery_app worker
+      -Q nyaya_flush -c 1 --loglevel=info -n flusher@%h
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres: { condition: service_healthy }
+      qdrant:   { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+
+  # ── Celery Beat (scheduled flush every 30s) ───────────────────────────────────
+  celery-beat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST:    postgres
+      REDIS_HOST: redis
+      PYTHONPATH: /app
+    command: >
+      celery -A backend.ingestion.workers.celery_app beat
+      --loglevel=info
+    depends_on: [redis]
+    restart: unless-stopped
+
+  # ── Dead-letter worker (inspect failed tasks) ─────────────────────────────────
+  celery-dlq:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST:    postgres
+      REDIS_HOST: redis
+      PYTHONPATH: /app
+    command: >
+      celery -A backend.ingestion.workers.celery_app worker
+      -Q nyaya_dlq -c 1 --loglevel=warning -n dlq@%h
+    depends_on: [redis]
+    restart: unless-stopped
 
 volumes:
   postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/postgres      # pin to your fastest NVMe mount
   qdrant_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/qdrant
   redis_data:
+    driver: local
   model_cache:
-  # es_data:    # uncomment this line when you uncomment elasticsearch above
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/model_cache   # models cached on fast NVMe, not re-downloaded

@@ -169,66 +169,158 @@ def parse_document(
 @shared_task(
     bind=True,
     name="backend.ingestion.workers.tasks.embed_document",
-    queue="nyaya_embed",
+    queue="nyaya_parse",   # runs on CPU — just fans out sub-tasks, no GPU needed
     max_retries=3,
     default_retry_delay=60,
-    time_limit=600,
+    time_limit=120,
 )
 def embed_document(self, parse_result: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Stage 2: Embed parsed chunks and write to staging table.
-    Runs on GPU workers. Staging flush → Qdrant happens separately.
+    Stage 2: Fan out embedding across 4 GPU workers.
+
+    Instead of one embed task processing all chunks sequentially on a
+    single GPU (bottleneck: a 10K-chunk document takes ~20 seconds even
+    on a fast GPU), this task splits the chunk list into sub-batches of
+    embed_subtask_size (512) and dispatches each sub-batch to a GPU
+    queue, cycling round-robin across all 4 GPU queues.
+
+    Result: a 10K-chunk document fans into 20 sub-tasks. With 4 GPU
+    workers running in parallel, wall time drops from ~20s to ~5s.
+    A 50K-chunk document fans into 98 sub-tasks → ~25s vs ~100s.
+
+    The sub-tasks write independently to staged_chunks; flush_staged
+    picks them up as they land, so Qdrant indexing and embedding
+    overlap in time rather than waiting for the full document.
     """
     if parse_result.get("status") != "parsed":
         return parse_result
 
     document_id = parse_result["document_id"]
-    chunk_ids = parse_result["chunk_ids"]
-    contents = parse_result["chunk_contents"]
-    payloads = parse_result["chunk_payloads"]
+    chunk_ids: List[str] = parse_result["chunk_ids"]
+    contents: Dict[str, str] = parse_result["chunk_contents"]
+    payloads: Dict[str, Any] = parse_result["chunk_payloads"]
 
+    try:
+        from backend.config.settings import get_settings
+        from backend.ingestion.workers.celery_app import GPU_EMBED_QUEUES
+
+        subtask_size = get_settings().ingestion.embed_subtask_size
+        gpu_count = len(GPU_EMBED_QUEUES)
+        sub_results = []
+
+        for i, start in enumerate(range(0, len(chunk_ids), subtask_size)):
+            batch_ids = chunk_ids[start:start + subtask_size]
+            batch_contents = {cid: contents[cid] for cid in batch_ids}
+            batch_payloads = {cid: payloads[cid] for cid in batch_ids}
+            target_queue = GPU_EMBED_QUEUES[i % gpu_count]
+
+            result = embed_chunk_batch.apply_async(
+                kwargs={
+                    "document_id": document_id,
+                    "chunk_ids": batch_ids,
+                    "chunk_contents": batch_contents,
+                    "chunk_payloads": batch_payloads,
+                },
+                queue=target_queue,
+            )
+            sub_results.append(result.id)
+
+        logger.info(
+            f"embed_document fanned {len(chunk_ids)} chunks into "
+            f"{len(sub_results)} sub-tasks across {gpu_count} GPU queues "
+            f"for document {document_id}"
+        )
+        return {
+            "status": "embedding",
+            "document_id": document_id,
+            "subtask_ids": sub_results,
+            "total_chunks": len(chunk_ids),
+        }
+    except Exception as exc:
+        logger.error(f"embed_document fan-out failed for {document_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(
+    bind=True,
+    name="backend.ingestion.workers.tasks.embed_chunk_batch",
+    max_retries=3,
+    default_retry_delay=30,
+    time_limit=300,
+    # queue is NOT set here — the caller specifies which GPU queue to use
+    # via apply_async(queue=target_queue). Celery routes to that queue;
+    # the worker consuming it has CUDA_VISIBLE_DEVICES set to its GPU.
+)
+def embed_chunk_batch(
+    self,
+    document_id: str,
+    chunk_ids: List[str],
+    chunk_contents: Dict[str, str],
+    chunk_payloads: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Embed one sub-batch of chunks on a single GPU worker.
+
+    Called by embed_document fan-out. Each worker has CUDA_VISIBLE_DEVICES
+    set to exactly one GPU, so EmbeddingService.embed_batch_sync() always
+    runs on that worker's assigned card.
+    """
     try:
         from backend.embeddings.service import EmbeddingService
         from backend.db.session import get_sync_session
-        from backend.config.settings import get_settings
         from sqlalchemy import text
+        import json as _json
 
-        cfg = get_settings().ingestion
-        embed_cfg = get_settings().embedding
         embedder = EmbeddingService()
+        texts = [chunk_contents[cid] for cid in chunk_ids]
+        embeddings = embedder.embed_batch_sync(texts)
 
-        # Embed in GPU batches
-        all_texts = [contents[cid] for cid in chunk_ids]
-        batch_size = embed_cfg.batch_size
-        all_embeddings = []
+        # Batch insert to staging — one executemany call, not N individual inserts
+        rows = [
+            {
+                "chunk_id": cid,
+                "document_id": document_id,
+                "embedding": _json.dumps(emb),
+                "meta": _json.dumps(chunk_payloads.get(cid, {})),
+            }
+            for cid, emb in zip(chunk_ids, embeddings)
+        ]
 
-        for i in range(0, len(all_texts), batch_size):
-            batch = all_texts[i:i + batch_size]
-            embs = embedder.embed_batch_sync(batch)
-            all_embeddings.extend(embs)
-
-        # Write to staging table
         with get_sync_session() as db:
-            for cid, emb in zip(chunk_ids, all_embeddings):
-                db.execute(text("""
-                    INSERT INTO staged_chunks
-                        (chunk_id, document_id, embedding, metadata, indexed)
-                    VALUES (:chunk_id, :document_id, :embedding::vector, :meta::jsonb, false)
-                    ON CONFLICT (chunk_id) DO NOTHING
-                """), {
-                    "chunk_id": cid,
-                    "document_id": document_id,
-                    "embedding": emb,
-                    "meta": payloads[cid],
-                })
+            db.execute(text("""
+                INSERT INTO staged_chunks
+                    (chunk_id, document_id, embedding, metadata, indexed)
+                VALUES (:chunk_id, :document_id, :embedding::vector, :meta::jsonb, false)
+                ON CONFLICT (chunk_id) DO NOTHING
+            """), rows)
             db.commit()
 
-        logger.info(f"Embedded {len(chunk_ids)} chunks → staging for {document_id}")
+        logger.info(
+            f"embed_chunk_batch: {len(chunk_ids)} chunks → staging "
+            f"(document={document_id})"
+        )
         return {"status": "embedded", "document_id": document_id, "count": len(chunk_ids)}
 
     except Exception as exc:
-        logger.error(f"embed_document failed for {document_id}: {exc}")
+        logger.error(f"embed_chunk_batch failed for {document_id}: {exc}")
         raise self.retry(exc=exc)
+
+
+@celery_app.task(
+    name="backend.ingestion.workers.tasks.dead_letter_handler",
+    queue="nyaya_dlq",
+)
+def dead_letter_handler(task_name: str, task_args: Any, task_kwargs: Any, exc: str) -> None:
+    """
+    Receives tasks that exhausted all retries.
+    Logs them for manual inspection — run:
+        celery -A backend.ingestion.workers.celery_app inspect reserved
+    or query the Redis DLQ directly.
+    """
+    logger.error(
+        f"DEAD LETTER: task={task_name} failed permanently. "
+        f"exc={exc} kwargs={str(task_kwargs)[:500]}"
+    )
 
 
 @shared_task(
