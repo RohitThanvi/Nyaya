@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import {
@@ -25,9 +25,15 @@ const NAV = [
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
   const router = useRouter()
-  const { user, clearUser } = useAuthStore()
+  const { user, clearUser, syncWithCookies } = useAuthStore()
   const { theme, setTheme } = useTheme()
   const [collapsed, setCollapsed] = useState(false)
+
+  // On every mount, verify the Zustand persisted auth state still matches
+  // the actual cookie. If the access_token cookie expired/was cleared while
+  // the app was closed, isAuthenticated in localStorage would still be true
+  // and the user would see a flash of authenticated UI before the 401 fires.
+  useEffect(() => { syncWithCookies() }, [])
 
   const handleLogout = () => {
     authApi.logout()

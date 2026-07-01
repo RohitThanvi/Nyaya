@@ -13,6 +13,10 @@ interface AuthStore {
   isAuthenticated: boolean
   setUser: (user: User) => void
   clearUser: () => void
+  /** Call on app mount: wipes persisted auth state if the access_token
+   *  cookie is gone so the store never shows isAuthenticated:true while
+   *  all API calls 401. */
+  syncWithCookies: () => void
 }
 
 export const useAuthStore = create<AuthStore>()(
@@ -22,6 +26,14 @@ export const useAuthStore = create<AuthStore>()(
       isAuthenticated: false,
       setUser: (user) => set({ user, isAuthenticated: true }),
       clearUser: () => set({ user: null, isAuthenticated: false }),
+      syncWithCookies: () => {
+        // Avoid importing Cookies at module level — js-cookie is browser-only
+        if (typeof document === 'undefined') return
+        const hasCookie = document.cookie.split(';').some(
+          (c) => c.trim().startsWith('access_token=') && c.trim().length > 'access_token='.length
+        )
+        if (!hasCookie) set({ user: null, isAuthenticated: false })
+      },
     }),
     { name: 'nyaya-auth' }
   )

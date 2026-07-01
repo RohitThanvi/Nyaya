@@ -80,41 +80,46 @@ async def get_current_user(
     return {"user_id": str(user.user_id), "email": user.email, "full_name": user.full_name, "role": user.role}
 
 
+import uuid as _uuid
+
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     existing = await db.execute(
         text("SELECT user_id FROM users WHERE email = :email"),
-        {"email": user_data.email},
+        {"email": user_data.email.lower().strip()},
     )
     if existing.fetchone():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
 
-    result = await db.execute(text("""
-        INSERT INTO users (email, full_name, role, hashed_password, bar_enrollment)
-        VALUES (:email, :full_name, :role, :hashed_password, :bar_enrollment)
-        RETURNING user_id
+    new_user_id = str(_uuid.uuid4())
+    await db.execute(text("""
+        INSERT INTO users (user_id, email, full_name, role, hashed_password, bar_enrollment, is_active)
+        VALUES (:user_id, :email, :full_name, :role, :hashed_password, :bar_enrollment, true)
     """), {
-        "email": user_data.email,
-        "full_name": user_data.full_name,
+        "user_id": new_user_id,
+        "email": user_data.email.lower().strip(),
+        "full_name": user_data.full_name.strip(),
         "role": user_data.role.value,
         "hashed_password": _hash_password(user_data.password),
         "bar_enrollment": user_data.bar_enrollment,
     })
-    user_id = str(result.fetchone().user_id)
     await db.commit()
 
     return TokenResponse(
-        access_token=_create_access_token(user_id, user_data.role.value),
-        refresh_token=_create_refresh_token(user_id),
+        access_token=_create_access_token(new_user_id, user_data.role.value),
+        refresh_token=_create_refresh_token(new_user_id),
         expires_in=_cfg.access_token_expire_minutes * 60,
     )
 
 
 @router.post("/login", response_model=TokenResponse)
 async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
+    if not credentials.email or not credentials.password:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="Email and password are required")
     result = await db.execute(
         text("SELECT user_id, hashed_password, role, is_active FROM users WHERE email = :email"),
-        {"email": credentials.email},
+        {"email": credentials.email.lower().strip()},
     )
     user = result.fetchone()
     if not user or not _verify_password(credentials.password, user.hashed_password):

@@ -353,8 +353,8 @@ class UploadResponse(BaseModel):
 # ─────────────────────────────────────────────
 
 class UserLogin(BaseModel):
-    email:    str
-    password: str
+    email:    str = Field(..., min_length=3)
+    password: str = Field(..., min_length=1)
 
 
 class UserCreate(BaseModel):

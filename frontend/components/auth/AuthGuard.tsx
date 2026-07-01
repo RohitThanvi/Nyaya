@@ -22,20 +22,21 @@ interface AuthGuardProps {
 
 export function AuthGuard({ children, redirectTo = '/auth/login' }: AuthGuardProps) {
   const router = useRouter()
-  const [checked, setChecked] = useState(false)
-  const [authenticated, setAuthenticated] = useState(false)
+  const [ready, setReady] = useState(false)
 
   useEffect(() => {
+    // Cookies.get returns undefined if the cookie doesn't exist, or '' if it
+    // exists but is empty. Both are falsy, but an empty string also means the
+    // cookie was set incorrectly (e.g. from a failed secure-cookie write on
+    // localhost HTTP). Treat either as unauthenticated.
     const token = Cookies.get('access_token')
-    if (!token) {
+    if (!token || token.trim() === '') {
       router.replace(redirectTo)
     } else {
-      setAuthenticated(true)
+      setReady(true)
     }
-    setChecked(true)
   }, [router, redirectTo])
 
-  if (!checked) return null
-  if (!authenticated) return null
+  if (!ready) return null
   return <>{children}</>
 }

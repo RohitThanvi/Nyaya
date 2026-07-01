@@ -19,6 +19,20 @@ const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 const API_PREFIX = '/api/v1'
 const CHUNK_SIZE = 10 * 1024 * 1024   // 10 MB per upload chunk
 
+// secure:true = cookies are only sent over HTTPS.
+// On localhost (HTTP), a secure cookie is SILENTLY DROPPED by the browser —
+// the Set-Cookie succeeds in JS but the browser never stores or sends it,
+// so every subsequent authenticated request gets 401, triggers the refresh
+// interceptor, fails again, and redirects to /auth/login in an infinite loop.
+const IS_SECURE = typeof window !== 'undefined' && window.location.protocol === 'https:'
+
+const COOKIE_OPTIONS = {
+  secure: IS_SECURE,
+  sameSite: 'strict' as const,
+  path: '/',          // without this, cookies set at /auth/login are scoped to that
+                      // path only — /dashboard, /search etc. never see the token
+}
+
 /**
  * Safely extract a human-readable message from an Axios/FastAPI error.
  *
@@ -66,28 +80,50 @@ function createApiClient(): AxiosInstance {
     (res) => res,
     async (error) => {
       const original = error.config
-      if (error.response?.status === 401 && !original._retry) {
+      // Only attempt refresh once per request, and only for 401s on non-auth routes
+      // (hitting /auth/login or /auth/refresh with a 401 means the credentials
+      // are genuinely wrong — triggering a refresh there is a silent infinite loop)
+      if (
+        error.response?.status === 401 &&
+        !original._retry &&
+        !original.url?.includes('/auth/')
+      ) {
         original._retry = true
-        try {
-          const refresh = Cookies.get('refresh_token')
-          if (refresh) {
-            // FIX: send as JSON body, not query param
+        const refresh = Cookies.get('refresh_token')
+        if (refresh) {
+          try {
             const res = await axios.post<TokenResponse>(
               `${BASE_URL}${API_PREFIX}/auth/refresh`,
               { refresh_token: refresh },
               { headers: { 'Content-Type': 'application/json' } }
             )
             const { access_token, refresh_token } = res.data
-            Cookies.set('access_token', access_token, { secure: true, sameSite: 'strict' })
+            Cookies.set('access_token', access_token, { ...COOKIE_OPTIONS, expires: 1 })
             if (refresh_token) {
-              Cookies.set('refresh_token', refresh_token, { secure: true, sameSite: 'strict' })
+              Cookies.set('refresh_token', refresh_token, { ...COOKIE_OPTIONS, expires: 30 })
             }
             original.headers.Authorization = `Bearer ${access_token}`
             return client(original)
+          } catch {
+            // Refresh failed — clear cookies AND Zustand store (which persists
+            // to localStorage; without this, isAuthenticated stays true after
+            // redirect and the next page load shows stale auth state).
+            Cookies.remove('access_token', { path: '/' })
+            Cookies.remove('refresh_token', { path: '/' })
+            try {
+              // Dynamic import to avoid circular deps (store imports nothing from api)
+              const { useAuthStore } = await import('@/lib/store')
+              useAuthStore.getState().clearUser()
+            } catch { /* non-fatal */ }
+            if (typeof window !== 'undefined') window.location.href = '/auth/login'
           }
-        } catch {
-          Cookies.remove('access_token')
-          Cookies.remove('refresh_token')
+        } else {
+          // No refresh token at all — go straight to login
+          Cookies.remove('access_token', { path: '/' })
+          try {
+            const { useAuthStore } = await import('@/lib/store')
+            useAuthStore.getState().clearUser()
+          } catch { /* non-fatal */ }
           if (typeof window !== 'undefined') window.location.href = '/auth/login'
         }
       }
@@ -105,8 +141,8 @@ export const api = createApiClient()
 export const authApi = {
   async login(email: string, password: string): Promise<TokenResponse> {
     const res = await api.post<TokenResponse>('/auth/login', { email, password })
-    Cookies.set('access_token', res.data.access_token, { secure: true, sameSite: 'strict' })
-    Cookies.set('refresh_token', res.data.refresh_token, { secure: true, sameSite: 'strict' })
+    Cookies.set('access_token', res.data.access_token, { ...COOKIE_OPTIONS, expires: 1 })
+    Cookies.set('refresh_token', res.data.refresh_token, { ...COOKIE_OPTIONS, expires: 30 })
     return res.data
   },
 
@@ -114,8 +150,8 @@ export const authApi = {
     email: string; password: string; full_name: string; role?: string
   }): Promise<TokenResponse> {
     const res = await api.post<TokenResponse>('/auth/register', data)
-    Cookies.set('access_token', res.data.access_token, { secure: true, sameSite: 'strict' })
-    Cookies.set('refresh_token', res.data.refresh_token, { secure: true, sameSite: 'strict' })
+    Cookies.set('access_token', res.data.access_token, { ...COOKIE_OPTIONS, expires: 1 })
+    Cookies.set('refresh_token', res.data.refresh_token, { ...COOKIE_OPTIONS, expires: 30 })
     return res.data
   },
 
@@ -129,8 +165,8 @@ export const authApi = {
   },
 
   logout() {
-    Cookies.remove('access_token')
-    Cookies.remove('refresh_token')
+    Cookies.remove('access_token', { path: '/' })
+    Cookies.remove('refresh_token', { path: '/' })
     if (typeof window !== 'undefined') window.location.href = '/auth/login'
   },
 }
