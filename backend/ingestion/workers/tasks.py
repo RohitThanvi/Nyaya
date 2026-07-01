@@ -194,11 +194,12 @@ def embed_document(self, parse_result: Dict[str, Any]) -> Dict[str, Any]:
         from sqlalchemy import text
 
         cfg = get_settings().ingestion
+        embed_cfg = get_settings().embedding
         embedder = EmbeddingService()
 
         # Embed in GPU batches
         all_texts = [contents[cid] for cid in chunk_ids]
-        batch_size = cfg.ingest_batch_size
+        batch_size = embed_cfg.batch_size
         all_embeddings = []
 
         for i in range(0, len(all_texts), batch_size):

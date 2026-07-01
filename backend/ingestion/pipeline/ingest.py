@@ -419,7 +419,7 @@ class IngestionPipeline:
         """
         await self._write_chunks_to_db(chunks)
 
-        batch_size = self._cfg.ingest_batch_size
+        batch_size = self._settings.embedding.batch_size
         staged: List[StagedChunk] = []
         failed_chunk_ids: List[str] = []
 

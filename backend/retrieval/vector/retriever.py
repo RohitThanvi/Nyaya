@@ -193,9 +193,10 @@ class VectorRetriever:
             return False
 
     async def ensure_collection(self):
-        """Create Qdrant collection if it doesn't exist, with on-disk config."""
+        """Create Qdrant collection if it doesn't exist."""
         from qdrant_client.models import (
-            VectorParams, Distance, HnswConfigDiff, OptimizersConfigDiff
+            VectorParams, Distance, HnswConfigDiff, OptimizersConfigDiff,
+            ScalarQuantizationConfig, ScalarType, QuantizationConfig,
         )
         cfg = self._cfg
         client = self._get_client()
@@ -205,6 +206,21 @@ class VectorRetriever:
             return
 
         distance_map = {"Cosine": Distance.COSINE, "Dot": Distance.DOT, "Euclid": Distance.EUCLID}
+
+        # Scalar quantization: compress float32 vectors → int8 in memory.
+        # 4× memory reduction with <1% recall loss at this dimensionality.
+        # Lets the full corpus stay RAM-resident on a 512GB machine even at
+        # 100M+ chunks (200GB float32 → 50GB int8 + 50GB payloads = 100GB total).
+        quantization = None
+        if cfg.scalar_quantization:
+            quantization = QuantizationConfig(
+                scalar=ScalarQuantizationConfig(
+                    type=ScalarType.INT8,
+                    quantile=0.99,   # clip top 1% of values for better quantization range
+                    always_ram=True, # keep quantized index in RAM even if on_disk_vectors=True
+                )
+            )
+
         await client.create_collection(
             collection_name=cfg.collection_name,
             vectors_config=VectorParams(
@@ -212,9 +228,26 @@ class VectorRetriever:
                 distance=distance_map.get(cfg.distance, Distance.COSINE),
                 on_disk=cfg.on_disk_vectors,
             ),
-            hnsw_config=HnswConfigDiff(m=cfg.hnsw_m, ef_construct=cfg.hnsw_ef_construct),
-            optimizers_config=OptimizersConfigDiff(indexing_threshold=10000),
+            hnsw_config=HnswConfigDiff(
+                m=cfg.hnsw_m,
+                ef_construct=cfg.hnsw_ef_construct,
+                # full_scan_threshold: below this many vectors, use brute-force
+                # instead of HNSW (faster for small corpora, irrelevant at scale)
+                full_scan_threshold=10000,
+            ),
+            optimizers_config=OptimizersConfigDiff(
+                # Delay building HNSW index until 100K vectors are staged —
+                # avoids rebuilding the index on every small batch during bulk
+                # ingestion, which would multiply ingestion time by ~10x.
+                indexing_threshold=100000,
+                memmap_threshold=200000,
+            ),
             on_disk_payload=cfg.on_disk_payload,
+            quantization_config=quantization,
         )
-        logger.info(f"Created Qdrant collection '{cfg.collection_name}' "
-                    f"(on_disk_vectors={cfg.on_disk_vectors})")
+        logger.info(
+            f"Created Qdrant collection '{cfg.collection_name}' "
+            f"(on_disk_vectors={cfg.on_disk_vectors}, "
+            f"scalar_quantization={cfg.scalar_quantization}, "
+            f"hnsw_m={cfg.hnsw_m}, ef_construct={cfg.hnsw_ef_construct})"
+        )

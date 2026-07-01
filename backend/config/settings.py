@@ -14,8 +14,10 @@ class DatabaseSettings(BaseSettings):
     name:         str = Field(default="nyaya_ai")
     user:         str = Field(default="nyaya_user")
     password:     str = Field(default="nyaya_pass")
-    pool_size:    int = Field(default=20)
-    max_overflow: int = Field(default=40)
+    # 512GB RAM machine — a large pool is fine; keep headroom for PG's own
+    # shared_buffers (128GB) and work_mem per parallel query worker.
+    pool_size:    int = Field(default=64)
+    max_overflow: int = Field(default=128)
     pool_timeout: int = Field(default=30)
     pool_recycle: int = Field(default=1800)
     echo:         bool = Field(default=False)
@@ -56,12 +58,25 @@ class QdrantSettings(BaseSettings):
     collection_name:   str  = Field(default="nyaya_legal_chunks")
     vector_size:       int  = Field(default=1024)
     distance:          str  = Field(default="Cosine")
-    hnsw_m:            int  = Field(default=16)
-    hnsw_ef_construct: int  = Field(default=200)
-    hnsw_ef:           int  = Field(default=128)
-    # on_disk=True is critical at TB scale — vectors memory-mapped, not RAM-resident
-    on_disk_payload:   bool = Field(default=True)
-    on_disk_vectors:   bool = Field(default=False)   # set True when corpus > 10M chunks
+    # m=32 (was 16): more edges per node = better recall at million-scale.
+    # ef_construct=400 (was 200): more candidates during index build = better
+    # index quality. One-time cost at ingestion, pays off on every query.
+    hnsw_m:            int  = Field(default=32)
+    hnsw_ef_construct: int  = Field(default=400)
+    # ef=256 at query time: larger beam = higher recall, 512GB RAM means no
+    # reason to compromise here — latency stays sub-10ms with RAM-resident index.
+    hnsw_ef:           int  = Field(default=256)
+    # 512GB RAM — keep everything in memory. on_disk_payload=False means
+    # payloads (chunk text, metadata) are RAM-resident, not mmap'd from disk.
+    # on_disk_vectors=False means the vector index itself is in RAM.
+    # At 50M chunks × 1024 dim × 4 bytes = ~200GB vectors + ~100GB payloads
+    # = ~300GB total, well within 512GB with room for PG + app overhead.
+    on_disk_payload:   bool = Field(default=False)
+    on_disk_vectors:   bool = Field(default=False)
+    # Scalar quantization: compress vectors from float32 → int8 in RAM
+    # (4× memory reduction with <1% recall loss). Keeps the full corpus
+    # in memory even as it grows past 200M chunks.
+    scalar_quantization: bool = Field(default=True)
 
 
 class RedisSettings(BaseSettings):
