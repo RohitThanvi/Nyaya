@@ -9,7 +9,7 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
-from celery import shared_task
+from backend.ingestion.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ def _run_async(coro):
         return loop.run_until_complete(coro)
 
 
-@shared_task(
+@celery_app.task(
     bind=True,
     name="backend.ingestion.workers.tasks.parse_document",
     queue="nyaya_parse",
@@ -107,25 +107,26 @@ def parse_document(
                 "uploaded_by": user_id,
             })
 
+            law_val = parsed.metadata.law.value if parsed.metadata.law else "other"
             chunk_rows = [{
                 "chunk_id": c.chunk_id, "document_id": document_id,
                 "chunk_type": c.chunk_type.value, "content": c.content,
                 "content_length": c.content_length, "chunk_index": c.chunk_index,
                 "page_number": c.page_number, "section_ref": c.section_ref,
-                "subsection_ref": c.subsection_ref,
+                "subsection_ref": c.subsection_ref, "law": law_val,
             } for c in chunks]
 
             INSERT_SQL = text("""
                 INSERT INTO chunks (
                     chunk_id, document_id, chunk_type, content,
                     content_length, chunk_index, page_number,
-                    section_ref, subsection_ref, content_tsv
+                    section_ref, subsection_ref, law, content_tsv
                 ) VALUES (
                     :chunk_id, :document_id, :chunk_type, :content,
                     :content_length, :chunk_index, :page_number,
-                    :section_ref, :subsection_ref,
+                    :section_ref, :subsection_ref, :law,
                     to_tsvector('english', :content)
-                ) ON CONFLICT (chunk_id) DO NOTHING
+                ) ON CONFLICT (chunk_id, law) DO NOTHING
             """)
             BATCH = 2000
             for i in range(0, len(chunk_rows), BATCH):
@@ -166,7 +167,7 @@ def parse_document(
         raise self.retry(exc=exc)
 
 
-@shared_task(
+@celery_app.task(
     bind=True,
     name="backend.ingestion.workers.tasks.embed_document",
     queue="nyaya_parse",   # runs on CPU — just fans out sub-tasks, no GPU needed
@@ -323,7 +324,7 @@ def dead_letter_handler(task_name: str, task_args: Any, task_kwargs: Any, exc: s
     )
 
 
-@shared_task(
+@celery_app.task(
     name="backend.ingestion.workers.tasks.flush_staged",
     queue="nyaya_flush",
 )

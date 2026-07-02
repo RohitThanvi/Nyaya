@@ -298,14 +298,14 @@ class IngestionPipeline:
             INSERT INTO chunks (
                 chunk_id, document_id, chunk_type, content,
                 content_length, chunk_index, page_number,
-                section_ref, subsection_ref, content_tsv
+                section_ref, subsection_ref, law, content_tsv
             ) VALUES (
                 :chunk_id, :document_id, :chunk_type, :content,
                 :content_length, :chunk_index, :page_number,
-                :section_ref, :subsection_ref,
+                :section_ref, :subsection_ref, :law,
                 to_tsvector('english', :content)
             )
-            ON CONFLICT (chunk_id) DO NOTHING
+            ON CONFLICT (chunk_id, law) DO NOTHING
         """)
 
         rows = [{
@@ -314,6 +314,7 @@ class IngestionPipeline:
             "content_length": c.content_length, "chunk_index": c.chunk_index,
             "page_number": c.page_number, "section_ref": c.section_ref,
             "subsection_ref": c.subsection_ref,
+            "law": (c.metadata.law.value if c.metadata and c.metadata.law else "other"),
         } for c in chunks]
 
         BATCH = 2000

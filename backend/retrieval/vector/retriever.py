@@ -79,6 +79,7 @@ class VectorRetriever:
         qdrant_filter = Filter(must=conditions) if conditions else None
 
         try:
+            from qdrant_client.models import SearchParams
             client = self._get_client()
             results = await client.search(
                 collection_name=self._cfg.collection_name,
@@ -87,6 +88,7 @@ class VectorRetriever:
                 score_threshold=score_threshold,
                 query_filter=qdrant_filter,
                 with_payload=True,
+                search_params=SearchParams(hnsw_ef=self._cfg.hnsw_ef, exact=False),
             )
         except Exception as e:
             logger.error(f"Qdrant search failed: {e}")
