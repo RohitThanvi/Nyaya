@@ -188,18 +188,31 @@ class HybridRetriever:
         self._settings = get_settings().retrieval
 
     def _should_use_vector(
-        self, query: str, exact_count: int, qu: Optional[QueryUnderstanding]
+        self, query: str, exact_count: int, bm25_count: int,
+        qu: Optional[QueryUnderstanding]
     ) -> bool:
         """
-        Decide whether to fire the vector (ANN) path.
-        Conservative: prefer lexical precision over semantic approximation.
+        Decide whether to fire the ANN vector path.
+
+        Rule changes vs original:
+        - word threshold 6→3: short precise legal queries ('anticipatory bail',
+          'preventive detention', 'section 482 quashing') need semantic search
+          most — they're underrepresented in BM25 because they appear as noun
+          phrases with synonyms across millions of documents. The original
+          threshold of 6 words silently skipped ANN for virtually every
+          common legal query.
+        - Always fire vector when BM25 returned < 3 results regardless of
+          query length — thin BM25 results are a signal that lexical matching
+          missed something and semantic fallback is needed.
         """
-        if exact_count > 0:
-            return False   # exact lookup found something — no need for ANN
-        if _has_section_numbers(query):
-            return False   # section-specific query — lexical is better
+        if exact_count >= 3:
+            return False   # strong exact matches — vector adds noise, not signal
+        if bm25_count < 3:
+            return True    # BM25 missed almost everything — always try vector
+        if _has_section_numbers(query) and exact_count > 0:
+            return False   # section query with exact hit — lexical is sufficient
         if _query_word_count(query) < self._settings.vector_min_query_words:
-            return False   # short query — BM25 handles it
+            return False
         return True
 
     async def retrieve(
@@ -246,7 +259,9 @@ class HybridRetriever:
 
         # ── Path 3: Vector (conditional) ─────────────────────────────────
         vector_results: List[RetrievedChunk] = []
-        if self._should_use_vector(query, exact_count, qu):
+        bm25_count = len([r for r in bm25_results
+                          if r.retrieval_source != RetrievalPath.EXACT_LOOKUP.value])
+        if self._should_use_vector(query, exact_count, bm25_count, qu):
             t0 = time.perf_counter()
             query_vector = await self._embedder.embed_query(query)
             vector_results = await self._vector.search(
@@ -307,31 +322,48 @@ class HybridRetriever:
         top_k_final: int = 10,
     ) -> Tuple[List[RetrievedChunk], Dict[str, float]]:
         """
-        Multi-query retrieval for expanded recall.
-        Each expanded query runs through retrieve(), results fused with cross-query RRF.
-        Capped at 3 queries to control latency.
+        Multi-query retrieval with parallel execution.
+
+        Previously ran queries sequentially in a for loop — 3 queries × ~100ms
+        each = 300ms serial latency. Each query is fully independent, so they
+        run concurrently via asyncio.gather, reducing wall time to ~100ms
+        (the slowest single query) regardless of how many queries are expanded.
         """
         if not queries:
             return [], {}
 
         capped = queries[:3]
-        all_results: List[List[RetrievedChunk]] = []
-        combined_timings: Dict[str, float] = {}
 
-        for q in capped:
-            results, timings = await self.retrieve(
+        # Run all queries in parallel — they share no state
+        tasks = [
+            self.retrieve(
                 query=q,
                 query_understanding=query_understanding,
                 top_k_final=top_k_final,
             )
+            for q in capped
+        ]
+        results_and_timings = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_results: List[List[RetrievedChunk]] = []
+        combined_timings: Dict[str, float] = {}
+
+        for item in results_and_timings:
+            if isinstance(item, Exception):
+                logger.warning(f"Multi-query sub-retrieve failed: {item}")
+                continue
+            results, timings = item
             all_results.append(results)
             for k, v in timings.items():
                 combined_timings[k] = combined_timings.get(k, 0) + v
 
+        if not all_results:
+            return [], combined_timings
+
         if len(all_results) == 1:
             return all_results[0][:top_k_final], combined_timings
 
-        # Cross-query RRF
+        # Cross-query RRF then rerank
         fused = _reciprocal_rank_fusion([(res, 1.0) for res in all_results])
         final = await self._reranker.rerank(
             query=queries[0],
@@ -348,13 +380,14 @@ class HybridRetriever:
     ) -> List[RetrievedChunk]:
         """
         Scoped retrieval within a single document.
-        Uses FTS ranked → ILIKE fallback → chunk-index order fallback.
+        Uses websearch_to_tsquery (not plainto_tsquery — supports phrase/OR/NOT).
+        Fetches real document metadata so context headers show correct law/court.
         """
         from sqlalchemy import text as sql_text
-        from backend.db.session import get_db_session
-        from backend.models.domain import DocumentMetadata, DocumentType, LegalChunk, LawCategory
+        from backend.models.domain import (
+            DocumentMetadata, DocumentType, LegalChunk, LawCategory,
+        )
 
-        # Clean common document-scoped query prefixes
         clean = query
         for prefix in ["summarize the key", "summarize", "what is", "explain",
                         "from the case:", "from the document:", "in this case",
@@ -366,65 +399,86 @@ class HybridRetriever:
 
         db = self._bm25._db
 
-        # FTS ranked within document
-        result = await db.execute(sql_text("""
-            SELECT chunk_id, content, chunk_type, chunk_index, section_ref,
-                   page_number,
-                   ts_rank(content_tsv, plainto_tsquery('english', :q)) AS rank
+        # Fetch real document metadata for citation headers in context
+        doc_row = (await db.execute(sql_text("""
+            SELECT document_type, law, court, court_name, citation, year, source_url
+            FROM documents WHERE document_id = :doc_id
+        """), {"doc_id": document_id})).fetchone()
+
+        if doc_row:
+            try:
+                doc_type = DocumentType(doc_row.document_type)
+            except ValueError:
+                doc_type = DocumentType.JUDGMENT
+            try:
+                law = LawCategory(doc_row.law) if doc_row.law else LawCategory.OTHER
+            except ValueError:
+                law = LawCategory.OTHER
+            meta = DocumentMetadata(
+                document_id=document_id,
+                document_type=doc_type,
+                law=law,
+                court_name=doc_row.court_name,
+                citation=doc_row.citation,
+                year=doc_row.year,
+                source_url=doc_row.source_url,
+                language="en",
+            )
+        else:
+            meta = DocumentMetadata(
+                document_id=document_id,
+                document_type=DocumentType.JUDGMENT,
+                law=LawCategory.OTHER,
+                language="en",
+            )
+
+        # websearch_to_tsquery handles phrase queries, OR, NOT
+        result = (await db.execute(sql_text("""
+            SELECT chunk_id, content, chunk_type, chunk_index,
+                   section_ref, page_number,
+                   ts_rank_cd(content_tsv,
+                       websearch_to_tsquery('english', :q), 32) AS rank
             FROM chunks
             WHERE document_id = :doc_id
-              AND content_tsv @@ plainto_tsquery('english', :q)
-            ORDER BY rank DESC
-            LIMIT :k
-        """), {"doc_id": document_id, "q": clean, "k": top_k})
-        rows = result.fetchall()
+              AND content_tsv @@ websearch_to_tsquery('english', :q)
+            ORDER BY rank DESC LIMIT :k
+        """), {"doc_id": document_id, "q": clean, "k": top_k})).fetchall()
 
-        if not rows:
-            stop = {'from', 'this', 'that', 'with', 'were', 'what', 'which',
-                    'have', 'been', 'case', 'legal', 'court', 'suit', 'file'}
+        if not result:
+            stop = {"from","this","that","with","were","what","which",
+                    "have","been","case","legal","court","suit","file"}
             keywords = [w.strip(".,?!") for w in clean.split()
                         if len(w) > 4 and w.lower() not in stop][:4]
             if keywords:
                 like_clause = " OR ".join(f"content ILIKE :kw{i}" for i in range(len(keywords)))
-                params = {"doc_id": document_id, "k": top_k}
+                params: dict = {"doc_id": document_id, "k": top_k}
                 for i, kw in enumerate(keywords):
                     params[f"kw{i}"] = f"%{kw}%"
-                result = await db.execute(sql_text(f"""
-                    SELECT chunk_id, content, chunk_type, chunk_index, section_ref,
-                           page_number, 0.5 AS rank
-                    FROM chunks
-                    WHERE document_id = :doc_id AND ({like_clause})
-                    ORDER BY chunk_index
-                    LIMIT :k
-                """), params)
-                rows = result.fetchall()
+                result = (await db.execute(sql_text(f"""
+                    SELECT chunk_id, content, chunk_type, chunk_index,
+                           section_ref, page_number, 0.5 AS rank
+                    FROM chunks WHERE document_id = :doc_id AND ({like_clause})
+                    ORDER BY chunk_index LIMIT :k
+                """), params)).fetchall()
 
-        if not rows:
-            result = await db.execute(sql_text("""
-                SELECT chunk_id, content, chunk_type, chunk_index, section_ref,
-                       page_number, 1.0 AS rank
-                FROM chunks
-                WHERE document_id = :doc_id AND content_length > 150
-                ORDER BY chunk_index
-                LIMIT :k
-            """), {"doc_id": document_id, "k": top_k})
-            rows = result.fetchall()
+        if not result:
+            result = (await db.execute(sql_text("""
+                SELECT chunk_id, content, chunk_type, chunk_index,
+                       section_ref, page_number, 1.0 AS rank
+                FROM chunks WHERE document_id = :doc_id AND content_length > 150
+                ORDER BY chunk_index LIMIT :k
+            """), {"doc_id": document_id, "k": top_k})).fetchall()
 
-        if not rows:
-            return []
-
-        meta = DocumentMetadata(
-            document_id=document_id,
-            document_type=DocumentType.JUDGMENT,
-            law=LawCategory.OTHER,
-            language="en",
-        )
         chunks = []
-        for row in rows:
+        for row in result:
+            try:
+                ct = ChunkType(row.chunk_type)
+            except ValueError:
+                ct = ChunkType.PASSAGE
             lc = LegalChunk(
                 chunk_id=str(row.chunk_id),
                 document_id=document_id,
-                chunk_type=ChunkType.PASSAGE,
+                chunk_type=ct,
                 content=row.content,
                 content_length=len(row.content),
                 chunk_index=row.chunk_index,

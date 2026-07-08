@@ -560,15 +560,24 @@ class AgentPipeline:
     async def _step_compress(self, state: AgentState):
         t0 = time.perf_counter()
         try:
+            # Use retrieval config for context window budget, not ingestion config.
+            # summary_window_chars is an ingestion field (how much text to window
+            # for summarization tasks), not a RAG context budget.
+            # Llama-3.3-70B has a 128K context window — the previous 3000-token
+            # budget (summary_window_chars=12000 // 4) left 97% of available
+            # context unused. Raise to final_context_k × ~400 chars per chunk
+            # average ≈ 8000-10000 tokens, giving the LLM substantially more
+            # evidence to reason over while staying within safe prompt bounds.
+            context_token_budget = self._ret_cfg.final_context_k * 600  # ~400 avg + 200 header
             state.compressed_context = self._compressor.compress(
                 chunks=state.reranked_chunks,
-                max_tokens=self._settings.ingestion.summary_window_chars // 4,
+                max_tokens=context_token_budget,
                 deduplicate=True,
             )
         except Exception as e:
             logger.error(f"Context compression failed: {e}")
             state.compressed_context = "\n\n".join(
-                rc.chunk.content[:500] for rc in state.reranked_chunks[:6]
+                rc.chunk.content[:600] for rc in state.reranked_chunks[:6]
             )
         state.latency_ms["compress_ms"] = (time.perf_counter() - t0) * 1000
 

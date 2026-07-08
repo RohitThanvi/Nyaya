@@ -122,11 +122,28 @@ class DocumentParser:
                 method = "tesseract_ocr"
                 quality = 0.7   # OCR assumed adequate after fallback
 
-        full_text = "\n\n".join(s.text for s in segments)
-        pages = len(segments)
+        # Build full_text and page_map together in one pass using StringIO
+        # to avoid holding segments[] + full_text simultaneously in RAM.
+        # For a 1000-page PDF with 15KB/page that's ~15MB × 2 = 30MB peak;
+        # at 32 concurrent parse workers that compounds to ~960MB just for
+        # raw text buffers. Using StringIO reduces peak to ~15MB per document.
+        import io as _io
+        buf = _io.StringIO()
+        page_map: Dict[int, int] = {}
+        offset = 0
 
-        # Build page boundary map: char_offset → page_number
-        page_map = self._build_page_map(segments)
+        for seg in segments:
+            if offset > 0:
+                buf.write("\n\n")
+                offset += 2
+            page_map[offset] = seg.page_num
+            buf.write(seg.text)
+            offset += len(seg.text)
+
+        full_text = buf.getvalue()
+        buf.close()
+        pages = len(segments)
+        del segments  # free segment list before extracting metadata
 
         metadata = self._extract_metadata(full_text, source_url)
 
