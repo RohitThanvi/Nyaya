@@ -36,12 +36,16 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 # ── Sync engine (Celery workers) ──────────────────────────────────────────────
+# pool_size must cover all concurrent Celery workers:
+#   32 parse workers + 4 embed workers + 1 flush = 37 minimum.
+# Each worker holds a connection for the duration of its DB operation,
+# so pool_size < worker count causes immediate timeouts under any real load.
 sync_engine = create_engine(
     _cfg.sync_url,
     poolclass=QueuePool,
-    pool_size=5,
-    max_overflow=10,
-    pool_timeout=30,
+    pool_size=48,
+    max_overflow=16,
+    pool_timeout=60,
     pool_recycle=1800,
     pool_pre_ping=True,
     echo=_cfg.echo,

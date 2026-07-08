@@ -76,16 +76,17 @@ CREATE TRIGGER trg_chunks_tsv
 
 -- Staged chunks table (ingestion pipeline)
 CREATE TABLE IF NOT EXISTS staged_chunks (
-    chunk_id    UUID PRIMARY KEY,
-    document_id UUID NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
-    embedding   JSONB NOT NULL,
-    metadata    JSONB NOT NULL DEFAULT '{}',
-    indexed     BOOLEAN NOT NULL DEFAULT false,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+    chunk_id     UUID PRIMARY KEY,
+    document_id  UUID NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+    embedding    JSONB NOT NULL,          -- float32 vector stored as JSON array
+    metadata     JSONB NOT NULL DEFAULT '{}',
+    indexed      BOOLEAN NOT NULL DEFAULT false,
+    processing   BOOLEAN NOT NULL DEFAULT false,  -- lock flag: prevents double-flush
+    created_at   TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS ix_staged_unindexed ON staged_chunks(indexed, document_id)
-    WHERE indexed = false;
+CREATE INDEX IF NOT EXISTS ix_staged_unindexed ON staged_chunks(indexed, processing, created_at)
+    WHERE indexed = false AND processing = false;
 
 -- Users table
 CREATE TABLE IF NOT EXISTS users (

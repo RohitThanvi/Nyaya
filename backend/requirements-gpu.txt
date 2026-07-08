@@ -1,0 +1,7 @@
+# GPU PyTorch — installed FIRST as a separate layer (largest dep ~2GB)
+# Pin exact versions: sentence-transformers 3.0.1 with torch 2.3.1+cu121
+# is a known-good combination for BAAI/bge-large-en-v1.5 on Ada Lovelace.
+# requirements-heavy.txt (CPU fallback) is no longer used in Docker builds.
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.3.1+cu121
+torchvision==0.18.1+cu121

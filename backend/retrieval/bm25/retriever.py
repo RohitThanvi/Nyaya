@@ -459,8 +459,17 @@ class BM25Retriever:
         conditions = ["c.content_tsv IS NOT NULL"]
         params: Dict[str, Any] = {}
         if law_filter:
+            law_vals = [l.value for l in law_filter]
+            # BOTH conditions are required:
+            # - d.law = ANY(...): filters documents table (index scan on documents)
+            # - c.law = ANY(...): allows Postgres to prune chunks partitions at
+            #   query planning time. Without c.law in WHERE, the planner cannot
+            #   eliminate partitions even though the JOIN result would be the same
+            #   — it must scan ALL partitions then join + filter, negating the
+            #   entire benefit of LIST(law) partitioning.
             conditions.append("d.law = ANY(:law_filter)")
-            params["law_filter"] = [l.value for l in law_filter]
+            conditions.append("c.law = ANY(:law_filter)")
+            params["law_filter"] = law_vals
         if court_filter:
             conditions.append("d.court = ANY(:court_filter)")
             params["court_filter"] = [c.value for c in court_filter]

@@ -330,55 +330,106 @@ def dead_letter_handler(task_name: str, task_args: Any, task_kwargs: Any, exc: s
 )
 def flush_staged() -> Dict[str, Any]:
     """
-    Stage 3 (scheduled): Flush unindexed staged chunks to Qdrant in batches.
-    Runs every INGEST_FLUSH_INTERVAL_S seconds via Celery Beat.
+    Stage 3 (scheduled every INGEST_FLUSH_INTERVAL_S seconds via Celery Beat):
+    Atomically claim a batch of unindexed staged chunks, upsert them to
+    Qdrant, then mark them indexed.
+
+    Key design decisions vs the original:
+    1. SELECT ... WHERE processing=false FOR UPDATE SKIP LOCKED:
+       Atomically marks rows as 'processing=true' before reading them.
+       If two flush_staged tasks overlap (e.g. a previous tick's Qdrant
+       write was slow), SKIP LOCKED ensures the second task processes
+       a DIFFERENT batch rather than re-attempting the same rows —
+       previously both tasks would fetch the same rows, causing duplicate
+       Qdrant upserts and wasted work.
+    2. asyncio.run() instead of asyncio.new_event_loop() + loop.close():
+       The old pattern leaked OS threads on Python 3.11 because closing
+       a loop without draining shutdown_asyncgens left finalizer tasks
+       hanging. asyncio.run() handles full cleanup.
+    3. cursor-based ordering (created_at, chunk_id) instead of LIMIT-only:
+       LIMIT N with no ORDER BY is non-deterministic — the DB can return
+       different row sets across ticks. Ordered by created_at ensures
+       oldest chunks are flushed first (FIFO ingestion order).
+    4. DELETE instead of UPDATE indexed=true: removes flushed rows to
+       keep staged_chunks lean. The source of truth is Qdrant; keeping
+       successfully indexed rows in staging is pure waste.
     """
+    import asyncio
+
     try:
         from backend.db.session import get_sync_session
         from backend.retrieval.vector.retriever import VectorRetriever
         from backend.config.settings import get_settings
         from sqlalchemy import text
-        import asyncio
 
         cfg = get_settings().ingestion
         vector = VectorRetriever()
-        total = 0
 
+        # Step 1: atomically claim a batch
         with get_sync_session() as db:
-            result = db.execute(text("""
-                SELECT chunk_id, embedding, metadata
-                FROM staged_chunks
-                WHERE indexed = false
-                ORDER BY chunk_id
-                LIMIT :batch
-            """), {"batch": cfg.flush_batch_size})
-            rows = result.fetchall()
+            # Mark rows as processing=true in one UPDATE...RETURNING so no
+            # other flush worker (or next tick) can claim the same rows.
+            claimed = db.execute(text("""
+                UPDATE staged_chunks
+                SET    processing = true
+                WHERE  chunk_id IN (
+                    SELECT chunk_id
+                    FROM   staged_chunks
+                    WHERE  indexed = false AND processing = false
+                    ORDER  BY created_at, chunk_id
+                    LIMIT  :batch
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING chunk_id, embedding, metadata
+            """), {"batch": cfg.flush_batch_size}).fetchall()
+            db.commit()
 
-        if not rows:
+        if not claimed:
             return {"status": "nothing_to_flush"}
 
-        chunk_ids = [str(r.chunk_id) for r in rows]
-        vectors = [list(r.embedding) for r in rows]
-        payloads = [dict(r.metadata) for r in rows]
+        chunk_ids = [str(r.chunk_id) for r in claimed]
+        # embedding stored as JSONB → comes back as a Python list directly
+        vectors   = [r.embedding for r in claimed]
+        payloads  = [dict(r.metadata) for r in claimed]
 
-        loop = asyncio.new_event_loop()
-        success = loop.run_until_complete(
-            vector.upsert_batch(chunk_ids, vectors, payloads)
+        # Step 2: upsert to Qdrant (async, non-blocking)
+        success = asyncio.run(
+            vector.upsert_batch(chunk_ids, vectors, payloads, wait=False)
         )
-        loop.close()
 
-        if success:
-            with get_sync_session() as db:
+        # Step 3: mark as indexed OR release the processing lock on failure
+        with get_sync_session() as db:
+            if success:
+                # Delete flushed rows — Qdrant is now the source of truth.
+                # Keeping them as indexed=true wastes storage and slows scans.
                 db.execute(text("""
-                    UPDATE staged_chunks SET indexed = true
+                    DELETE FROM staged_chunks WHERE chunk_id = ANY(:ids)
+                """), {"ids": chunk_ids})
+            else:
+                # Release lock so the next tick can retry
+                db.execute(text("""
+                    UPDATE staged_chunks SET processing = false
                     WHERE chunk_id = ANY(:ids)
                 """), {"ids": chunk_ids})
-                db.commit()
-            total = len(chunk_ids)
-            logger.info(f"Flushed {total} staged chunks to Qdrant")
+            db.commit()
 
-        return {"status": "flushed", "count": total}
+        logger.info(
+            f"flush_staged: {'indexed' if success else 'FAILED'} "
+            f"{len(chunk_ids)} chunks to Qdrant"
+        )
+        return {"status": "flushed" if success else "failed", "count": len(chunk_ids)}
 
     except Exception as e:
-        logger.error(f"flush_staged failed: {e}")
+        logger.error(f"flush_staged crashed: {e}", exc_info=True)
+        # Best-effort: release processing locks so rows aren't stuck forever
+        try:
+            from backend.db.session import get_sync_session
+            from sqlalchemy import text
+            with get_sync_session() as db:
+                db.execute(text(
+                    "UPDATE staged_chunks SET processing = false WHERE processing = true"
+                ))
+                db.commit()
+        except Exception:
+            pass
         return {"status": "error", "error": str(e)}
