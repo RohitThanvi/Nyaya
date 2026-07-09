@@ -213,6 +213,20 @@ export interface ResumableUploadOptions {
   sourceUrl?: string
   onProgress?: (info: UploadProgressInfo) => void
   signal?: AbortSignal
+  uploadId?: string   // pre-registered by bulk/initiate — skips the initiate round-trip
+}
+
+/**
+ * Convenience alias used by the bulk upload page.
+ * Accepts a pre-registered uploadId from POST /upload/bulk/initiate
+ * so the chunked upload can skip its own initiate call.
+ */
+export async function resumableUpload(
+  file: File,
+  onProgress?: (info: UploadProgressInfo) => void,
+  uploadId?: string,
+): Promise<UploadResponse> {
+  return uploadResumable(file, { onProgress, uploadId })
 }
 
 /**
@@ -225,7 +239,7 @@ export async function uploadResumable(
   file: File,
   options: ResumableUploadOptions = {},
 ): Promise<UploadResponse> {
-  const { sourceUrl, onProgress, signal } = options
+  const { sourceUrl, onProgress, signal, uploadId } = options
   const report = (info: Partial<UploadProgressInfo>) =>
     onProgress?.({
       phase: 'preparing', percent: 0, bytesUploaded: 0,
@@ -237,7 +251,7 @@ export async function uploadResumable(
     return _uploadSingleShot(file, sourceUrl, report)
   }
 
-  return _uploadChunkedResumable(file, sourceUrl, report, signal)
+  return _uploadChunkedResumable(file, sourceUrl, report, signal, uploadId)
 }
 
 async function _uploadSingleShot(
@@ -279,6 +293,7 @@ async function _uploadChunkedResumable(
   sourceUrl: string | undefined,
   report: (info: Partial<UploadProgressInfo>) => void,
   signal?: AbortSignal,
+  preRegisteredId?: string,
 ): Promise<UploadResponse> {
   const fingerprint = _fileFingerprint(file)
   const chunkSize = DEFAULT_CHUNK_SIZE
@@ -319,8 +334,12 @@ async function _uploadChunkedResumable(
     } catch {
       // Session expired or server lost it — start fresh below
       _clearSession(fingerprint)
-      uploadId = await _initSession(file, sourceUrl, chunkSize)
+      uploadId = preRegisteredId ?? await _initSession(file, sourceUrl, chunkSize)
     }
+  } else if (preRegisteredId) {
+    // Bulk-initiated: session already registered via /upload/bulk/initiate —
+    // skip the per-file initiate round-trip
+    uploadId = preRegisteredId
   } else {
     uploadId = await _initSession(file, sourceUrl, chunkSize)
   }

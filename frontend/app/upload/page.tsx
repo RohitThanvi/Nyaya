@@ -1,388 +1,495 @@
 'use client'
 
-import { useState, useCallback, useRef, useEffect } from 'react'
-import { FileUp, File, CheckCircle2, AlertCircle, X, Search, Loader2, RotateCcw, WifiOff } from 'lucide-react'
-import { chatApi, getErrorMessage } from '@/lib/api'
-import { uploadResumable, cancelResumableUpload, type UploadProgressInfo } from '@/lib/resumableUpload'
-import type { UploadResponse, LegalResponse } from '@/types/api'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  Upload, X, CheckCircle, AlertCircle, Clock, FileText,
+  Loader2, FolderOpen, ChevronDown, ChevronUp, RotateCcw,
+} from 'lucide-react'
 import { toast } from 'sonner'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import { CitationList } from '@/components/citations/CitationCard'
+import axios from 'axios'
+import Cookies from 'js-cookie'
+import { getErrorMessage } from '@/lib/api'
+import { resumableUpload } from '@/lib/resumableUpload'
+import type { UploadProgressInfo } from '@/lib/resumableUpload'
 
-type UploadState = 'idle' | 'uploading' | 'resuming' | 'finalising' | 'indexing' | 'ready' | 'error'
+// ── Constants ─────────────────────────────────────────────────────────────────
+const BASE_URL   = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const API        = `${BASE_URL}/api/v1`
+const CONCURRENT = 4                               // parallel uploads at once
+const CHUNK_MB   = 50                              // MB per HTTP chunk
+const MAX_GB     = 50                              // max file size
+const ALLOWED    = ['.pdf', '.txt', '.docx', '.doc']
 
-const MAX_FILE_GB = 10   // matches backend INGEST_MAX_FILE_SIZE_GB
+// ── Types ─────────────────────────────────────────────────────────────────────
+type FileStatus = 'queued' | 'uploading' | 'processing' | 'done' | 'error' | 'cancelled'
 
-function formatBytes(bytes: number): string {
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`
-  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`
-  return `${(bytes / 1e3).toFixed(0)} KB`
+interface FileEntry {
+  id:        string
+  file:      File
+  status:    FileStatus
+  progress:  UploadProgressInfo | null
+  result:    { document_id: string; pages: number; chunks: number } | null
+  error:     string | null
+  uploadId:  string | null   // server-assigned resumable upload ID
 }
 
-export default function UploadPage() {
-  const [uploadState, setUploadState] = useState<UploadState>('idle')
-  const [progressInfo, setProgressInfo] = useState<UploadProgressInfo | null>(null)
-  const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [dragActive, setDragActive] = useState(false)
-  const [query, setQuery] = useState('')
-  const [isQuerying, setIsQuerying] = useState(false)
-  const [queryResult, setQueryResult] = useState<LegalResponse | null>(null)
-  const [isOffline, setIsOffline] = useState(false)
-  const fileInputRef = useRef<HTMLInputElement>(null)
-  const currentFileRef = useRef<File | null>(null)
-  const abortControllerRef = useRef<AbortController | null>(null)
+function fmt(bytes: number): string {
+  if (bytes < 1024)        return `${bytes} B`
+  if (bytes < 1024 ** 2)  return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 ** 3)  return `${(bytes / 1024 ** 2).toFixed(1)} MB`
+  return `${(bytes / 1024 ** 3).toFixed(2)} GB`
+}
 
-  // Detect network status — surfaces clearly when a retry is network-related
-  useEffect(() => {
-    const goOffline = () => setIsOffline(true)
-    const goOnline = () => setIsOffline(false)
-    window.addEventListener('offline', goOffline)
-    window.addEventListener('online', goOnline)
-    setIsOffline(!navigator.onLine)
-    return () => {
-      window.removeEventListener('offline', goOffline)
-      window.removeEventListener('online', goOnline)
-    }
-  }, [])
+function authHeaders() {
+  const t = Cookies.get('access_token')
+  return t ? { Authorization: `Bearer ${t}` } : {}
+}
 
-  const handleFile = useCallback(async (file: File) => {
-    const allowed = ['application/pdf', 'text/plain']
-    const maxBytes = MAX_FILE_GB * 1024 * 1024 * 1024
-    if (!allowed.includes(file.type) && !file.name.toLowerCase().endsWith('.pdf') && !file.name.toLowerCase().endsWith('.txt')) {
-      toast.error('Only PDF and TXT files are supported')
-      return
-    }
-    if (file.size > maxBytes) {
-      toast.error(`File too large. Maximum ${MAX_FILE_GB}GB`)
-      return
-    }
-
-    currentFileRef.current = file
-    abortControllerRef.current = new AbortController()
-    setUploadState('uploading')
-    setProgressInfo(null)
-    setError(null)
-    setUploadResult(null)
-    setQueryResult(null)
-
-    try {
-      const result = await uploadResumable(file, {
-        signal: abortControllerRef.current.signal,
-        onProgress: (info) => {
-          setProgressInfo(info)
-          if (info.phase === 'resuming') setUploadState('resuming')
-          else if (info.phase === 'finalising') setUploadState('finalising')
-          else if (info.phase === 'indexing') setUploadState('indexing')
-          else if (info.phase === 'uploading') setUploadState('uploading')
-        },
-      })
-      setUploadResult(result)
-      setUploadState('ready')
-      if (result.status === 'partial') {
-        toast.warning(
-          `Indexed ${result.chunks_created} chunks, but ${result.failed_chunk_ids.length} ` +
-          `failed embedding and won't appear in semantic search. Text search still works for them.`
-        )
-      } else if (result.status === 'processing') {
-        toast.info('Document uploaded. Indexing is running in the background — it will be ready for search shortly.')
-      } else {
-        toast.success(`Indexed ${result.chunks_created} chunks from ${result.pages} pages`)
-      }
-    } catch (err: any) {
-      if (err?.name === 'AbortError') {
-        setUploadState('idle')
-        return
-      }
-      const msg = getErrorMessage(err, 'Upload failed. Please try again.')
-      setError(msg)
-      setUploadState('error')
-      toast.error(msg)
-    }
-  }, [])
-
-  const handleRetry = useCallback(() => {
-    // Re-dropping the same file triggers automatic resume — the engine
-    // detects the matching fingerprint in localStorage and only uploads
-    // whatever bytes never made it to the server.
-    if (currentFileRef.current) {
-      handleFile(currentFileRef.current)
-    }
-  }, [handleFile])
-
-  const handleCancel = useCallback(async () => {
-    abortControllerRef.current?.abort()
-    if (currentFileRef.current) {
-      await cancelResumableUpload(currentFileRef.current)
-    }
-    setUploadState('idle')
-    setProgressInfo(null)
-  }, [])
-
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    setDragActive(false)
-    const file = e.dataTransfer.files[0]
-    if (file) handleFile(file)
-  }, [handleFile])
-
-  const handleQuery = async () => {
-    if (!query.trim() || !uploadResult || isQuerying) return
-    setIsQuerying(true)
-    try {
-      const result = await chatApi.chatWithDocument(uploadResult.document_id, query.trim(), [])
-      setQueryResult(result)
-    } catch {
-      toast.error('Query failed. Please try again.')
-    } finally {
-      setIsQuerying(false)
-    }
+// ── Bulk initiate: register all files server-side in one request ──────────────
+async function bulkInitiate(files: File[]): Promise<Map<string, string>> {
+  const items = files.map(f => ({
+    filename:     f.name,
+    total_size:   f.size,
+    content_type: f.type || 'application/pdf',
+  }))
+  const res = await axios.post(`${API}/upload/bulk/initiate`, items, {
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+  })
+  const map = new Map<string, string>()
+  for (const s of res.data.sessions) {
+    if (s.upload_id) map.set(s.filename, s.upload_id)
   }
+  return map
+}
 
-  const reset = () => {
-    currentFileRef.current = null
-    setUploadState('idle')
-    setProgressInfo(null)
-    setUploadResult(null)
-    setError(null)
-    setQuery('')
-    setQueryResult(null)
+// ── Status badge ──────────────────────────────────────────────────────────────
+function StatusBadge({ status }: { status: FileStatus }) {
+  const cfg: Record<FileStatus, { icon: React.ReactNode; label: string; cls: string }> = {
+    queued:     { icon: <Clock size={12} />,   label: 'Queued',     cls: 'text-muted-foreground' },
+    uploading:  { icon: <Loader2 size={12} className="animate-spin" />, label: 'Uploading', cls: 'text-primary' },
+    processing: { icon: <Loader2 size={12} className="animate-spin" />, label: 'Processing', cls: 'text-amber-400' },
+    done:       { icon: <CheckCircle size={12} />, label: 'Done',   cls: 'text-emerald-400' },
+    error:      { icon: <AlertCircle size={12} />, label: 'Failed', cls: 'text-destructive' },
+    cancelled:  { icon: <X size={12} />,       label: 'Cancelled',  cls: 'text-muted-foreground' },
   }
+  const { icon, label, cls } = cfg[status]
+  return (
+    <span className={`flex items-center gap-1 text-xs font-medium ${cls}`}>
+      {icon}{label}
+    </span>
+  )
+}
 
-  const phaseLabel: Record<string, string> = {
-    uploading: 'Uploading document…',
-    resuming: 'Resuming interrupted upload…',
-    finalising: 'Verifying upload…',
-    indexing: 'Building semantic index…',
-  }
-
-  const phaseSubLabel: Record<string, string> = {
-    uploading: 'Transferring your file to the server',
-    resuming: 'Picking up exactly where the connection dropped — no data lost',
-    finalising: 'Checking all bytes arrived correctly',
-    indexing: 'Chunking, embedding, and indexing for search',
-  }
-
-  const isBusy = ['uploading', 'resuming', 'finalising', 'indexing'].includes(uploadState)
+// ── Per-file progress bar ─────────────────────────────────────────────────────
+function FileRow({
+  entry, onCancel, onRetry,
+}: {
+  entry: FileEntry
+  onCancel: (id: string) => void
+  onRetry:  (id: string) => void
+}) {
+  const pct = entry.progress?.percent ?? 0
+  const isActive = entry.status === 'uploading' || entry.status === 'processing'
 
   return (
-    <div className="min-h-screen bg-background">
-      <div className="max-w-4xl mx-auto px-6 py-12">
-        <div className="mb-10">
-          <h1 className="text-2xl font-bold mb-2">Upload & Analyze Document</h1>
-          <p className="text-sm text-muted-foreground">
-            Upload a PDF judgment, statute, or any legal document to ask questions against it.
-            Large files upload in resumable chunks — network drops won&apos;t lose your progress.
+    <div className="border border-border rounded-lg p-3 bg-card/30 gap-2 flex flex-col">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <FileText size={14} className="text-muted-foreground shrink-0" />
+          <span className="text-sm truncate font-medium" title={entry.file.name}>
+            {entry.file.name}
+          </span>
+          <span className="text-xs text-muted-foreground shrink-0">{fmt(entry.file.size)}</span>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <StatusBadge status={entry.status} />
+          {entry.status === 'error' && (
+            <button onClick={() => onRetry(entry.id)}
+              className="text-xs text-primary hover:underline flex items-center gap-1">
+              <RotateCcw size={11} /> Retry
+            </button>
+          )}
+          {(entry.status === 'queued' || isActive) && (
+            <button onClick={() => onCancel(entry.id)}
+              className="text-muted-foreground hover:text-foreground">
+              <X size={14} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Progress bar */}
+      {isActive && (
+        <div className="space-y-1">
+          <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
+            <div
+              className="h-full bg-primary rounded-full transition-all duration-300"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <div className="flex justify-between text-[10px] text-muted-foreground">
+            <span>{entry.progress?.message || '…'}</span>
+            <span>{pct.toFixed(0)}%</span>
+          </div>
+        </div>
+      )}
+
+      {/* Results */}
+      {entry.status === 'done' && entry.result && (
+        <div className="flex gap-3 text-xs text-muted-foreground">
+          {entry.result.pages > 0 && <span>{entry.result.pages} pages</span>}
+          {entry.result.chunks > 0 && <span>· {entry.result.chunks} chunks indexed</span>}
+        </div>
+      )}
+      {entry.status === 'error' && entry.error && (
+        <p className="text-xs text-destructive">{entry.error}</p>
+      )}
+    </div>
+  )
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
+export default function UploadPage() {
+  const [entries, setEntries] = useState<FileEntry[]>([])
+  const [dragging, setDragging] = useState(false)
+  const [showDone, setShowDone] = useState(true)
+  const [initiating, setInitiating] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Active upload slots — keys are entry IDs currently being uploaded
+  const active = useRef<Set<string>>(new Set())
+  // Abort map for in-progress uploads
+  const abortMap = useRef<Map<string, () => void>>(new Map())
+  // Entries ref so callbacks always have fresh state
+  const entriesRef = useRef<FileEntry[]>([])
+  entriesRef.current = entries
+
+  // ── Stats ──────────────────────────────────────────────────────────────────
+  const total     = entries.length
+  const done      = entries.filter(e => e.status === 'done').length
+  const failed    = entries.filter(e => e.status === 'error').length
+  const cancelled = entries.filter(e => e.status === 'cancelled').length
+  const inFlight  = entries.filter(e => e.status === 'uploading' || e.status === 'processing').length
+  const queued    = entries.filter(e => e.status === 'queued').length
+  const overallPct = total === 0 ? 0 : Math.round(((done + failed + cancelled) / total) * 100)
+  const allFinished = total > 0 && queued === 0 && inFlight === 0
+
+  // ── Update a single entry ──────────────────────────────────────────────────
+  const update = useCallback((id: string, patch: Partial<FileEntry>) => {
+    setEntries(prev => prev.map(e => e.id === id ? { ...e, ...patch } : e))
+  }, [])
+
+  // ── Upload one file ────────────────────────────────────────────────────────
+  const uploadOne = useCallback(async (entry: FileEntry) => {
+    if (entry.status === 'cancelled') return
+    active.current.add(entry.id)
+    update(entry.id, { status: 'uploading' })
+
+    let aborted = false
+    abortMap.current.set(entry.id, () => { aborted = true })
+
+    try {
+      const result = await resumableUpload(
+        entry.file,
+        (info) => {
+          if (aborted) return
+          const status: FileStatus = info.phase === 'ready' ? 'done'
+            : info.phase === 'indexing' || info.phase === 'finalising' ? 'processing'
+            : 'uploading'
+          update(entry.id, { progress: info, status })
+        },
+        entry.uploadId ?? undefined,   // pre-registered upload_id
+      )
+
+      if (aborted) return
+
+      update(entry.id, {
+        status: 'done',
+        result: {
+          document_id: result.document_id,
+          pages:  result.pages,
+          chunks: result.chunks_created,
+        },
+        progress: { phase: 'ready', percent: 100, bytesUploaded: entry.file.size,
+                    bytesTotal: entry.file.size, message: 'Indexed' },
+      })
+    } catch (err: any) {
+      if (aborted) return
+      update(entry.id, {
+        status: 'error',
+        error: getErrorMessage(err, 'Upload failed'),
+      })
+    } finally {
+      active.current.delete(entry.id)
+      abortMap.current.delete(entry.id)
+      startNext()
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [update])
+
+  // ── Drain queue: start up to CONCURRENT uploads ────────────────────────────
+  const startNext = useCallback(() => {
+    const slots = CONCURRENT - active.current.size
+    if (slots <= 0) return
+    const waiting = entriesRef.current.filter(e => e.status === 'queued')
+    waiting.slice(0, slots).forEach(e => uploadOne(e))
+  }, [uploadOne])
+
+  // ── Add files to queue ─────────────────────────────────────────────────────
+  const enqueue = useCallback(async (files: File[]) => {
+    const valid = files.filter(f => {
+      const ext = '.' + f.name.split('.').pop()!.toLowerCase()
+      if (!ALLOWED.includes(ext)) {
+        toast.error(`${f.name}: unsupported type (${ext})`)
+        return false
+      }
+      if (f.size > MAX_GB * 1024 ** 3) {
+        toast.error(`${f.name}: exceeds ${MAX_GB}GB limit`)
+        return false
+      }
+      return true
+    })
+    if (!valid.length) return
+
+    setInitiating(true)
+    let uploadIdMap = new Map<string, string>()
+    try {
+      uploadIdMap = await bulkInitiate(valid)
+    } catch (err) {
+      toast.error('Failed to register uploads with server — will retry on upload start')
+    } finally {
+      setInitiating(false)
+    }
+
+    const newEntries: FileEntry[] = valid.map(f => ({
+      id:       crypto.randomUUID(),
+      file:     f,
+      status:   'queued',
+      progress: null,
+      result:   null,
+      error:    null,
+      uploadId: uploadIdMap.get(f.name) ?? null,
+    }))
+
+    setEntries(prev => [...prev, ...newEntries])
+    // startNext will fire via useEffect watching entries
+  }, [])
+
+  // Start uploads whenever entries changes and there are free slots
+  useEffect(() => {
+    startNext()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entries.length])
+
+  // ── Cancel ─────────────────────────────────────────────────────────────────
+  const cancel = useCallback((id: string) => {
+    const abort = abortMap.current.get(id)
+    if (abort) abort()
+    update(id, { status: 'cancelled', error: null })
+    active.current.delete(id)
+    setTimeout(startNext, 50)
+  }, [update, startNext])
+
+  // ── Retry ──────────────────────────────────────────────────────────────────
+  const retry = useCallback((id: string) => {
+    update(id, { status: 'queued', error: null, progress: null })
+    setTimeout(startNext, 50)
+  }, [update, startNext])
+
+  const cancelAll = () => {
+    entries.filter(e => e.status === 'queued' || e.status === 'uploading' || e.status === 'processing')
+      .forEach(e => cancel(e.id))
+  }
+
+  const retryAll = () => {
+    entries.filter(e => e.status === 'error').forEach(e => retry(e.id))
+  }
+
+  const clearAll = () => {
+    cancelAll()
+    setEntries([])
+    active.current.clear()
+  }
+
+  // ── Drop handling ──────────────────────────────────────────────────────────
+  const collectFiles = async (items: DataTransferItemList | FileList): Promise<File[]> => {
+    const files: File[] = []
+
+    const walk = async (entry: FileSystemEntry | null) => {
+      if (!entry) return
+      if (entry.isFile) {
+        await new Promise<void>(res => {
+          (entry as FileSystemFileEntry).file(f => { files.push(f); res() }, () => res())
+        })
+      } else if (entry.isDirectory) {
+        await new Promise<void>(res => {
+          const reader = (entry as FileSystemDirectoryEntry).createReader()
+          const readAll = () => reader.readEntries(async entries => {
+            if (!entries.length) return res()
+            for (const e of entries) await walk(e)
+            readAll()
+          }, () => res())
+          readAll()
+        })
+      }
+    }
+
+    if (items instanceof FileList) {
+      for (const f of Array.from(items)) files.push(f)
+    } else {
+      for (const item of Array.from(items)) {
+        if (item.kind !== 'file') continue
+        const entry = item.webkitGetAsEntry?.()
+        if (entry) await walk(entry)
+        else { const f = item.getAsFile(); if (f) files.push(f) }
+      }
+    }
+    return files
+  }
+
+  const onDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault()
+    setDragging(false)
+    const files = await collectFiles(e.dataTransfer.items)
+    if (files.length) enqueue(files)
+  }, [enqueue])
+
+  const onFileInput = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files?.length) {
+      enqueue(Array.from(e.target.files))
+      e.target.value = ''
+    }
+  }, [enqueue])
+
+  const visibleDone = showDone ? entries : entries.filter(e => e.status !== 'done')
+
+  return (
+    <div className="max-w-4xl mx-auto p-6 space-y-6">
+
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">Bulk Document Upload</h1>
+          <p className="text-sm text-muted-foreground mt-1">
+            Drop thousands of files or entire folders — {CONCURRENT} upload in parallel, all indexed automatically
           </p>
         </div>
-
-        {isOffline && isBusy && (
-          <div className="mb-4 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300">
-            <WifiOff className="w-4 h-4 shrink-0" />
-            You&apos;re offline. The upload will automatically resume once your connection returns.
-          </div>
-        )}
-
-        {uploadState === 'idle' && (
-          <div
-            onDragOver={(e) => { e.preventDefault(); setDragActive(true) }}
-            onDragLeave={() => setDragActive(false)}
-            onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
-            className={`border-2 border-dashed rounded-2xl p-16 text-center cursor-pointer transition-all ${
-              dragActive
-                ? 'border-primary bg-primary/5 scale-[1.01]'
-                : 'border-border hover:border-primary/40 hover:bg-card/50'
-            }`}
-          >
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".pdf,.txt"
-              className="hidden"
-              onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
-            />
-            <FileUp className={`w-12 h-12 mx-auto mb-4 transition-colors ${dragActive ? 'text-primary' : 'text-muted-foreground'}`} />
-            <p className="text-base font-medium mb-1">Drop your document here</p>
-            <p className="text-sm text-muted-foreground mb-4">or click to browse</p>
-            <div className="flex items-center justify-center gap-4 text-xs text-muted-foreground">
-              <span className="flex items-center gap-1.5 border border-border rounded-full px-3 py-1">
-                <File className="w-3 h-3" /> PDF
-              </span>
-              <span className="flex items-center gap-1.5 border border-border rounded-full px-3 py-1">
-                <File className="w-3 h-3" /> TXT
-              </span>
-              <span className="border border-border rounded-full px-3 py-1">Up to {MAX_FILE_GB}GB · resumable</span>
-            </div>
-          </div>
-        )}
-
-        {isBusy && (
-          <div className="bg-card border border-border rounded-2xl p-8 text-center">
-            <Loader2 className="w-10 h-10 mx-auto mb-4 text-primary animate-spin" />
-            <p className="font-medium mb-2">{phaseLabel[uploadState] || 'Processing…'}</p>
-            <p className="text-sm text-muted-foreground mb-4">
-              {progressInfo?.message || phaseSubLabel[uploadState] || ''}
-            </p>
-            <div className="w-full bg-background rounded-full h-2 overflow-hidden">
-              <div
-                className="h-full bg-primary rounded-full transition-all duration-300"
-                style={{ width: `${progressInfo?.percent ?? (uploadState === 'indexing' ? 95 : 0)}%` }}
-              />
-            </div>
-            <div className="flex items-center justify-between mt-2 text-xs text-muted-foreground">
-              <span>
-                {progressInfo ? `${formatBytes(progressInfo.bytesUploaded)} / ${formatBytes(progressInfo.bytesTotal)}` : ''}
-              </span>
-              <span>{progressInfo?.percent ?? 0}%</span>
-            </div>
-            {progressInfo && progressInfo.currentRetry > 0 && (
-              <p className="text-xs text-amber-400 mt-2">
-                Retrying chunk (attempt {progressInfo.currentRetry}) — your upload is not lost
-              </p>
+        {total > 0 && (
+          <div className="flex items-center gap-2">
+            {failed > 0 && (
+              <button onClick={retryAll}
+                className="text-xs px-3 py-1.5 rounded border border-border hover:bg-muted flex items-center gap-1">
+                <RotateCcw size={12} /> Retry {failed} failed
+              </button>
             )}
-            <button
-              onClick={handleCancel}
-              className="mt-4 text-xs text-muted-foreground hover:text-foreground underline transition-colors"
-            >
-              Cancel upload
+            <button onClick={clearAll}
+              className="text-xs px-3 py-1.5 rounded border border-destructive/50 text-destructive hover:bg-destructive/10">
+              Clear all
             </button>
           </div>
         )}
+      </div>
 
-        {uploadState === 'error' && (
-          <div className="bg-card border border-red-500/30 rounded-2xl p-8 text-center">
-            <AlertCircle className="w-10 h-10 mx-auto mb-4 text-red-400" />
-            <p className="font-medium mb-1 text-red-400">Upload interrupted</p>
-            <p className="text-sm text-muted-foreground mb-6">{error}</p>
-            <div className="flex items-center justify-center gap-3">
-              <button
-                onClick={handleRetry}
-                className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                Resume upload
-              </button>
-              <button onClick={reset}
-                className="px-4 py-2 bg-card border border-border rounded-lg text-sm hover:border-primary/40 transition-colors">
-                Start over
-              </button>
-            </div>
-            <p className="text-xs text-muted-foreground mt-4">
-              Resume will continue from where it stopped — already-uploaded data isn&apos;t re-sent.
-            </p>
+      {/* Drop zone */}
+      <div
+        onDragOver={e => { e.preventDefault(); setDragging(true) }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={onDrop}
+        onClick={() => fileInputRef.current?.click()}
+        className={`border-2 border-dashed rounded-xl p-10 text-center cursor-pointer transition-all
+          ${dragging
+            ? 'border-primary bg-primary/10 scale-[1.01]'
+            : 'border-border hover:border-primary/50 hover:bg-muted/20'
+          }`}
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept=".pdf,.txt,.docx,.doc"
+          className="hidden"
+          onChange={onFileInput}
+        />
+        {initiating ? (
+          <div className="flex flex-col items-center gap-2">
+            <Loader2 size={36} className="animate-spin text-primary" />
+            <p className="text-sm text-muted-foreground">Registering files…</p>
           </div>
-        )}
-
-        {uploadState === 'ready' && uploadResult && (
-          <div className="space-y-6">
-            <div className={`bg-card border rounded-xl p-5 flex items-start justify-between ${
-              uploadResult.status === 'partial' ? 'border-amber-500/30' : 'border-emerald-500/30'
-            }`}>
-              <div className="flex items-start gap-4">
-                <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${
-                  uploadResult.status === 'partial'
-                    ? 'bg-amber-400/10 border border-amber-400/20'
-                    : 'bg-emerald-400/10 border border-emerald-400/20'
-                }`}>
-                  {uploadResult.status === 'partial'
-                    ? <AlertCircle className="w-5 h-5 text-amber-400" />
-                    : <CheckCircle2 className="w-5 h-5 text-emerald-400" />}
-                </div>
-                <div>
-                  <p className="font-medium text-sm mb-1">{uploadResult.filename}</p>
-                  <div className="flex items-center gap-3 text-xs text-muted-foreground flex-wrap">
-                    {uploadResult.pages > 0 && <span>{uploadResult.pages} pages</span>}
-                    {uploadResult.pages > 0 && <span>·</span>}
-                    {uploadResult.chunks_created > 0
-                      ? <span>{uploadResult.chunks_created} searchable chunks</span>
-                      : <span className="text-primary">Indexing in background…</span>
-                    }
-                    {uploadResult.status === 'partial' ? (
-                      <>
-                        <span>·</span>
-                        <span className="text-amber-400">{uploadResult.failed_chunk_ids.length} chunk(s) not embedded</span>
-                      </>
-                    ) : uploadResult.status === 'processing' ? (
-                      <>
-                        <span>·</span>
-                        <span className="text-primary">Will be searchable shortly</span>
-                      </>
-                    ) : (
-                      <>
-                        <span>·</span>
-                        <span className="text-emerald-400">Ready for Q&amp;A</span>
-                      </>
-                    )}
-                  </div>
-                </div>
-              </div>
-              <button onClick={reset} className="text-muted-foreground hover:text-foreground transition-colors">
-                <X className="w-4 h-4" />
-              </button>
+        ) : (
+          <div className="flex flex-col items-center gap-3">
+            <div className={`p-4 rounded-full transition-colors ${dragging ? 'bg-primary/20' : 'bg-muted'}`}>
+              {dragging ? <FolderOpen size={32} className="text-primary" /> : <Upload size={32} className="text-muted-foreground" />}
             </div>
-
-            <div className="bg-card border border-border rounded-xl p-5">
-              <h2 className="font-medium text-sm mb-3">Ask questions about this document</h2>
-              <div className="flex gap-3">
-                <input
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleQuery()}
-                  placeholder="e.g. 'What are the key findings?' or 'Which sections are discussed?'"
-                  className="flex-1 bg-background border border-border rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary/50 placeholder:text-muted-foreground"
-                />
-                <button
-                  onClick={handleQuery}
-                  disabled={isQuerying || !query.trim()}
-                  className="flex items-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {isQuerying ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-                  Ask
-                </button>
-              </div>
-              <div className="flex flex-wrap gap-2 mt-3">
-                {['Summarize the facts', 'What is the final order?', 'List all sections discussed', 'What are the key legal principles?'].map(s => (
-                  <button key={s} onClick={() => setQuery(s)}
-                    className="text-xs border border-border rounded-full px-2.5 py-1 text-muted-foreground hover:border-primary/40 hover:text-primary transition-colors">
-                    {s}
-                  </button>
-                ))}
-              </div>
+            <div>
+              <p className="font-medium">Drop files or folders here</p>
+              <p className="text-sm text-muted-foreground mt-1">
+                PDF, DOCX, TXT · Up to {MAX_GB}GB per file · Drag entire folders for recursive import
+              </p>
             </div>
-
-            {isQuerying && (
-              <div className="bg-card border border-border rounded-xl p-6 text-center">
-                <Loader2 className="w-6 h-6 mx-auto mb-2 text-primary animate-spin" />
-                <p className="text-sm text-muted-foreground">Searching document…</p>
-              </div>
-            )}
-            {queryResult && !isQuerying && (
-              <div className="bg-card border border-border rounded-xl p-6 space-y-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium">Answer</span>
-                  <span className={`text-xs ${queryResult.confidence > 0.7 ? 'text-emerald-400' : 'text-amber-400'}`}>
-                    {Math.round(queryResult.confidence * 100)}% confidence
-                  </span>
-                </div>
-                <div className="prose prose-sm prose-invert max-w-none">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{queryResult.answer}</ReactMarkdown>
-                </div>
-                {queryResult.hallucination_flags?.length > 0 && (
-                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-                    <p className="text-xs font-semibold text-amber-400 mb-1">⚠ Unverified citations</p>
-                    {queryResult.hallucination_flags.map((flag, i) => (
-                      <p key={i} className="text-xs text-amber-300/80">{flag}</p>
-                    ))}
-                  </div>
-                )}
-                <CitationList citations={queryResult.citations ?? []} />
-              </div>
-            )}
+            <div className="flex items-center gap-2 mt-1">
+              <span className="text-xs px-3 py-1.5 bg-primary text-primary-foreground rounded-full font-medium">
+                Browse Files
+              </span>
+              <span className="text-xs text-muted-foreground">or drag here</span>
+            </div>
           </div>
         )}
       </div>
+
+      {/* Overall progress bar */}
+      {total > 0 && (
+        <div className="space-y-2 p-4 bg-card border border-border rounded-xl">
+          <div className="flex justify-between items-center">
+            <div className="flex items-center gap-4 text-sm">
+              <span className="font-medium">{total} file{total !== 1 ? 's' : ''}</span>
+              {done > 0       && <span className="text-emerald-400">✓ {done} done</span>}
+              {inFlight > 0   && <span className="text-primary">⟳ {inFlight} active</span>}
+              {queued > 0     && <span className="text-muted-foreground">· {queued} queued</span>}
+              {failed > 0     && <span className="text-destructive">✕ {failed} failed</span>}
+              {cancelled > 0  && <span className="text-muted-foreground">✕ {cancelled} cancelled</span>}
+            </div>
+            <span className="text-sm font-mono text-muted-foreground">{overallPct}%</span>
+          </div>
+          <div className="h-2 w-full bg-muted rounded-full overflow-hidden">
+            <div className="h-full flex rounded-full overflow-hidden">
+              <div className="bg-emerald-500 transition-all duration-500"
+                style={{ width: `${(done / total) * 100}%` }} />
+              <div className="bg-destructive transition-all duration-500"
+                style={{ width: `${(failed / total) * 100}%` }} />
+              <div className="bg-muted-foreground/30 transition-all duration-500"
+                style={{ width: `${(cancelled / total) * 100}%` }} />
+            </div>
+          </div>
+          {allFinished && (
+            <p className="text-xs text-muted-foreground">
+              {done > 0 && `${done} document${done !== 1 ? 's' : ''} indexed and ready for search. `}
+              {failed > 0 && `${failed} failed — click Retry above.`}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* File list */}
+      {total > 0 && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-medium text-muted-foreground">
+              {visibleDone.length} of {total} shown
+            </span>
+            {done > 0 && (
+              <button onClick={() => setShowDone(p => !p)}
+                className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
+                {showDone ? <><ChevronUp size={12}/> Hide {done} done</> : <><ChevronDown size={12}/> Show {done} done</>}
+              </button>
+            )}
+          </div>
+          <div className="space-y-2 max-h-[60vh] overflow-y-auto pr-1">
+            {visibleDone.map(e => (
+              <FileRow key={e.id} entry={e} onCancel={cancel} onRetry={retry} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

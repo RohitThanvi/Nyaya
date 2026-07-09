@@ -30,7 +30,7 @@ from backend.config.settings import get_settings
 from backend.db.session import get_db
 from backend.embeddings.service import EmbeddingService
 from backend.ingestion.pipeline.ingest import IngestionPipeline
-from backend.models.domain import UploadResponse
+from backend.models.domain import BulkInitiateItem, BulkInitiateResponse, UploadResponse
 from backend.retrieval.vector.retriever import VectorRetriever
 
 router = APIRouter(prefix="/upload", tags=["upload"])
@@ -208,7 +208,61 @@ async def init_chunked_upload(
     }
 
 
-@router.get("/chunked/{upload_id}/status")
+@router.post("/bulk/initiate", response_model=BulkInitiateResponse)
+async def bulk_initiate(items: List[BulkInitiateItem]):
+    """
+    Register N files for chunked upload in a single request.
+
+    Instead of calling POST /upload/chunked/initiate once per file
+    (N round trips for N files), the frontend sends all filenames + sizes
+    at once and gets back all upload_ids in one response. For thousands
+    of files this saves thousands of sequential round trips at queue time.
+
+    The actual byte transfer still uses the existing per-file chunked
+    upload routes — this just pre-registers all sessions at once.
+    """
+    from typing import List as _List
+    ALLOWED = {".pdf", ".txt", ".docx", ".doc"}
+    MAX_GB = _cfg.ingestion.max_file_size_gb
+    MAX_BYTES = int(MAX_GB * 1024 ** 3)
+
+    sessions = []
+    for item in items:
+        ext = Path(item.filename).suffix.lower()
+        if ext not in ALLOWED:
+            sessions.append({
+                "filename": item.filename,
+                "upload_id": None,
+                "error": f"Unsupported file type: {ext}. Allowed: {', '.join(ALLOWED)}",
+            })
+            continue
+        if item.total_size > MAX_BYTES:
+            sessions.append({
+                "filename": item.filename,
+                "upload_id": None,
+                "error": f"File exceeds {MAX_GB}GB limit ({item.total_size / 1e9:.1f}GB).",
+            })
+            continue
+
+        upload_id = str(uuid.uuid4())
+        upload_dir = _chunked_dir(upload_id)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        _write_meta(upload_id, {
+            "filename": item.filename,
+            "total_size": item.total_size,
+            "content_type": item.content_type,
+        })
+        sessions.append({
+            "filename": item.filename,
+            "upload_id": upload_id,
+            "chunk_size_bytes": _cfg.ingestion.chunk_size_mb * 1024 * 1024,
+            "error": None,
+        })
+
+    return BulkInitiateResponse(sessions=sessions, total_files=len(items))
+
+
+
 async def chunked_upload_status(upload_id: str):
     """
     Resume entry point. Frontend calls this after reconnecting following any

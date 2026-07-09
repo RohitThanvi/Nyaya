@@ -344,8 +344,19 @@ class UploadResponse(BaseModel):
     pages:          int
     chunks_created: int
     failed_chunk_ids: List[str] = Field(default_factory=list)
-    status:         str   # "success" | "partial" | "empty"
+    status:         str   # "success" | "partial" | "empty" | "processing"
     message:        str
+
+
+class BulkInitiateItem(BaseModel):
+    filename: str
+    total_size: int
+    content_type: str = "application/pdf"
+
+
+class BulkInitiateResponse(BaseModel):
+    sessions: List[dict]   # [{filename, upload_id, chunk_size_bytes}]
+    total_files: int
 
 
 # ─────────────────────────────────────────────
