@@ -71,19 +71,28 @@ logger = logging.getLogger(__name__)
 # with a tag pointing at a chunk_id that was genuinely retrieved is treated
 # as grounded; everything else is fuzzy-matched as a weaker fallback and,
 # failing that, stripped from the final answer entirely by AssemblyAgent.
-_GROUNDING_RULES = """GROUNDING RULES (mandatory):
-1. Use ONLY the legal sources provided below. Do not use outside knowledge of
-   Indian law, even if you are confident it is correct — only what appears in
-   the sources counts as a source for this answer.
+_GROUNDING_RULES = """GROUNDING RULES (mandatory — violating these is a critical error):
+1. Use ONLY the legal sources provided below. Do not use prior knowledge of
+   Indian law, even if you are confident it is correct — only what appears
+   verbatim in the provided sources counts as evidence for this answer.
 2. Immediately after every section number, citation, or specific legal claim,
    insert the matching <CHUNK:xxxxxxxx> tag copied exactly from that source's
    header. Example: "Section 318 BNS defines cheating <CHUNK:a1b2c3d4>."
 3. If the sources do not contain information needed to answer part of the
-   question, explicitly say so in that part of your answer instead of filling
-   the gap from memory. Do not guess section numbers.
-4. Never state a section number, case citation, or punishment that does not
-   appear verbatim in the sources below.
+   question, say exactly: "The provided sources do not cover [specific gap]."
+   Do NOT fill gaps from memory. Do NOT guess section numbers.
+4. Never state a section number, case citation, punishment, or deadline that
+   does not appear verbatim in one of the sources below.
+5. CRITICAL — IPC/BNS TRANSITION: The Bharatiya Nyaya Sanhita 2023 (BNS)
+   replaced the Indian Penal Code 1860 (IPC) with DIFFERENT section numbers.
+   IPC §302 ≠ BNS §103. Never substitute one law's section number for another.
+   If a source says "Section 103 BNS", cite exactly that.
+   If a source says "Section 302 IPC", cite exactly that.
+6. Never merge provisions from different laws as if they are the same statute.
+   BNS, IPC, BNSS, CrPC, BSA, and Evidence Act are separate with different
+   numbering schemes.
 """
+
 
 _PROMPTS: Dict[str, str] = {
     LegalIntentType.PROVISION_LOOKUP.value: """You are NyayaAI, an expert Indian legal assistant.
@@ -127,21 +136,31 @@ QUERY: {query}
 Provide a helpful, accurate answer using only the sources above.""",
 
     LegalIntentType.SUMMARIZATION.value: """You are NyayaAI, an expert Indian legal assistant.
-Provide a structured summary of this judgment.
 
+""" + _GROUNDING_RULES + """
 JUDGMENT EXCERPTS:
 {context}
 
 QUERY: {query}
 
-Structure: Facts | Issues | Holdings | Ratio | Final Order""",
+Provide a structured summary using ONLY the excerpts above.
+Structure: Facts | Issues | Holdings | Ratio | Final Order
+For each section, cite the source chunk tag. If an excerpt does not cover a section, write "Not available in provided excerpts" — do not invent facts, dates, or names.""",
 
     LegalIntentType.DRAFTING_REQUEST.value: """You are NyayaAI, an expert Indian legal assistant.
+
+GROUNDING RULES (mandatory):
+1. Use the legal sources below for all section numbers, precedents, and legal standards cited in the draft.
+2. Tag every section number or precedent with its source <CHUNK:xxxxxxxx> tag.
+3. Mark any clause requiring information not present in the sources with [VERIFY: reason].
+4. Never invent section numbers, case citations, or statutory penalties.
+
+LEGAL SOURCES:
 {context}
 
 DRAFTING QUERY: {query}
 
-Complete the draft with accurate legal language. Mark any field requiring advocate verification with [VERIFY: reason].""",
+Complete the draft with accurate legal language. Every cited provision must appear in the sources above.""",
 }
 
 
@@ -599,8 +618,13 @@ class AgentPipeline:
 
             history_text = ""
             if history:
+                def _role(m: Any) -> str:
+                    r = m.get("role") if isinstance(m, dict) else getattr(m, "role", "user")
+                    return str(r).upper()
+                def _content(m: Any) -> str:
+                    return str(m.get("content", "") if isinstance(m, dict) else getattr(m, "content", ""))
                 history_text = "\n".join(
-                    f"{m.role.upper()}: {m.content}" for m in history[-6:]
+                    f"{_role(m)}: {_content(m)}" for m in history[-6:]
                 )
                 prompt = f"CONVERSATION HISTORY:\n{history_text}\n\n{prompt}"
 

@@ -20,9 +20,16 @@ logger = logging.getLogger(__name__)
 
 # Chunk size targets (characters)
 MIN_CHUNK_CHARS = 150
-TARGET_CHUNK_CHARS = 1200
-MAX_CHUNK_CHARS = 2000
-OVERLAP_SENTENCES = 2      # sentences carried over from previous chunk
+# bge-large-en-v1.5 has a 512-token context window. At ~3.5 chars/token
+# (legal English with citations), 512 tokens ≈ 1792 chars. TARGET keeps
+# chunks safely within the embedding window. MAX enforces a hard ceiling.
+# The original code only checked MAX_CHUNK_CHARS=2000, meaning chunks
+# frequently hit 1999 chars ≈ 571 tokens — silently truncating the tail
+# of every large chunk during embedding (the model's tokenizer truncates
+# to 512 tokens without error), losing the last ~60 tokens of each chunk.
+TARGET_CHUNK_CHARS = 1400   # ~400 token target — gives overlap buffer
+MAX_CHUNK_CHARS    = 1700   # ~486 token hard max — stays inside 512-tok window
+OVERLAP_SENTENCES  = 2      # sentences carried over from previous chunk
 
 # Header patterns that identify structural section boundaries
 _SECTION_HEADERS: Dict[ChunkType, List[re.Pattern]] = {
@@ -87,14 +94,20 @@ _SECTION_REF_PATTERN = re.compile(
 # header keywords, used by _is_section_boundary to force chunk splits at
 # real structural boundaries instead of relying purely on size overflow.
 _SECTION_BOUNDARY_PATTERN = re.compile(
-    r"^(?:FACTS?|BACKGROUND|THE CASE|BRIEF FACTS?|FACTUAL BACKGROUND|"
+    r"^(?:"
+    # Judgment structural headers (colon-terminated)
+    r"FACTS?|BACKGROUND|THE CASE|BRIEF FACTS?|FACTUAL BACKGROUND|"
     r"ISSUE[S]?(?:\s+(?:FOR CONSIDERATION|RAISED|FRAMED))?|QUESTION[S]?(?:\s+OF LAW)?|"
     r"POINT[S]?\s+FOR DETERMINATION|"
     r"SUBMISSIONS?|ARGUMENTS?|CONTENTIONS?|"
     r"FINDING[S]?|OBSERVATIONS?|ANALYSIS|DISCUSSION|"
     r"RATIO DECIDENDI|THE LAW|PRINCIPLE|LEGAL POSITION|"
     r"ORDER|JUDGMENT|DECREE|RESULT|OPERATIVE PART|IN THE RESULT|CONSEQUENTLY|"
-    r"FINAL ORDER)\s*:",
+    r"FINAL ORDER"
+    r")\s*:|"
+    # Statute section headers: "318. Cheating.\u2014" or "Section 318." or "482."
+    # Without this, BNS/BNSS/BSA PDFs never get structure-driven splits.
+    r"(?:Section\s+)?\d+[A-Za-z]?\.\s+[A-Z][^.\u2014:\n]{2,60}?[.\u2014:]",
     re.IGNORECASE,
 )
 
@@ -258,7 +271,7 @@ class LegalChunker:
             sent_len = len(sent)
             starts_new_section = self._is_section_boundary(sent)
 
-            should_split_for_size = current_len + sent_len > MAX_CHUNK_CHARS and current_sents
+            should_split_for_size = current_len + sent_len > TARGET_CHUNK_CHARS and current_sents
             should_split_for_structure = (
                 starts_new_section and current_sents and current_len >= MIN_SECTION_CHARS
             )
@@ -350,9 +363,24 @@ class LegalChunker:
         try:
             import spacy
             nlp = spacy.load("en_core_web_sm")
-            # Disable components we don't need for sentence splitting
-            nlp.select_pipes(enable=["senter"] if "senter" in nlp.pipe_names else ["parser"])
+            # Disable NER, lemmatizer, morphologizer — we only need sentence
+            # boundaries. Keep whichever of senter/parser provides sents.
+            # NEVER try to enable only senter when parser is the active
+            # sentence detector: that disables parser and doc.sents raises
+            # ValueError because nothing provides the sents attribute.
+            has_senter = "senter" in nlp.pipe_names
+            has_parser = "parser" in nlp.pipe_names
+            disable = []
+            for pipe in nlp.pipe_names:
+                if pipe not in {"senter", "parser", "tok2vec", "transformer"}:
+                    disable.append(pipe)
+            if has_senter and not has_parser:
+                pass  # senter alone is fine
+            elif has_parser and not has_senter:
+                pass  # parser provides sents — keep it, disable the rest
+            if disable:
+                nlp.select_pipes(disable=disable)
             return nlp
-        except Exception:
-            logger.info("spaCy not available; using regex sentence splitter")
+        except Exception as e:
+            logger.info(f"spaCy unavailable ({e}); using regex sentence splitter")
             return None
