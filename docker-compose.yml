@@ -79,22 +79,17 @@ services:
       QDRANT_HOST:        qdrant
       REDIS_HOST:         redis
       PYTHONPATH:         /app
-      EMBEDDING_DEVICE:   cuda
-      EMBEDDING_BATCH_SIZE: 512
-      EMBEDDING_FP16:     "true"
+      EMBEDDING_DEVICE:   cpu
+      EMBEDDING_BATCH_SIZE: 32
+      EMBEDDING_FP16:     "false"
     volumes:
       - ./data:/app/data
       - model_cache:/app/data/embeddings/models
     ports:
       - "8000:8000"
-    # Backend uses GPU for real-time query embedding (embed_query is ~5ms on GPU)
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["0"]         # query embedding on GPU 0
-              capabilities: [gpu]
+    # Backend uses GPU for real-time query embedding when available.
+    # GPU reservation is in docker-compose.gpu.yml — not here, so the
+    # stack starts cleanly in WSL2 / CPU-only environments.
     depends_on:
       postgres: { condition: service_healthy }
       qdrant:   { condition: service_healthy }
@@ -157,9 +152,9 @@ services:
       REDIS_HOST:           redis
       PYTHONPATH:           /app
       CUDA_VISIBLE_DEVICES: "0"
-      EMBEDDING_DEVICE:     cuda
-      EMBEDDING_BATCH_SIZE: "512"
-      EMBEDDING_FP16:       "true"
+      EMBEDDING_DEVICE:     cpu
+      EMBEDDING_BATCH_SIZE: "32"
+      EMBEDDING_FP16:       "false"
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_embed_gpu_0 -c 1 --loglevel=info -n embed_gpu0@%h
@@ -167,13 +162,6 @@ services:
     volumes:
       - ./data:/app/data
       - model_cache:/app/data/embeddings/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["0"]
-              capabilities: [gpu]
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
@@ -190,9 +178,9 @@ services:
       REDIS_HOST:           redis
       PYTHONPATH:           /app
       CUDA_VISIBLE_DEVICES: "1"
-      EMBEDDING_DEVICE:     cuda
-      EMBEDDING_BATCH_SIZE: "512"
-      EMBEDDING_FP16:       "true"
+      EMBEDDING_DEVICE:     cpu
+      EMBEDDING_BATCH_SIZE: "32"
+      EMBEDDING_FP16:       "false"
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_embed_gpu_1 -c 1 --loglevel=info -n embed_gpu1@%h
@@ -200,13 +188,6 @@ services:
     volumes:
       - ./data:/app/data
       - model_cache:/app/data/embeddings/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["1"]
-              capabilities: [gpu]
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
@@ -223,9 +204,9 @@ services:
       REDIS_HOST:           redis
       PYTHONPATH:           /app
       CUDA_VISIBLE_DEVICES: "2"
-      EMBEDDING_DEVICE:     cuda
-      EMBEDDING_BATCH_SIZE: "512"
-      EMBEDDING_FP16:       "true"
+      EMBEDDING_DEVICE:     cpu
+      EMBEDDING_BATCH_SIZE: "32"
+      EMBEDDING_FP16:       "false"
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_embed_gpu_2 -c 1 --loglevel=info -n embed_gpu2@%h
@@ -233,13 +214,6 @@ services:
     volumes:
       - ./data:/app/data
       - model_cache:/app/data/embeddings/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["2"]
-              capabilities: [gpu]
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
@@ -256,9 +230,9 @@ services:
       REDIS_HOST:           redis
       PYTHONPATH:           /app
       CUDA_VISIBLE_DEVICES: "3"
-      EMBEDDING_DEVICE:     cuda
-      EMBEDDING_BATCH_SIZE: "512"
-      EMBEDDING_FP16:       "true"
+      EMBEDDING_DEVICE:     cpu
+      EMBEDDING_BATCH_SIZE: "32"
+      EMBEDDING_FP16:       "false"
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_embed_gpu_3 -c 1 --loglevel=info -n embed_gpu3@%h
@@ -266,13 +240,6 @@ services:
     volumes:
       - ./data:/app/data
       - model_cache:/app/data/embeddings/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["3"]
-              capabilities: [gpu]
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }

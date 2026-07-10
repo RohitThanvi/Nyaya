@@ -1,21 +1,25 @@
 # ── NyayaAI Backend Dockerfile ────────────────────────────────────────────────
-# Base: CUDA 12.1 + cuDNN 8 on Ubuntu 22.04 (matches RTX 6000 Ada / Ada Lovelace)
-# Provides: nvidia-smi, cuda runtime, libcudnn — needed by PyTorch GPU workers.
-# CPU-only fallback: build with --build-arg BASE=python:3.11-slim and set
-# EMBEDDING_DEVICE=cpu in .env (useful for CI / systems without NVIDIA drivers).
-ARG BASE=nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+# Default base: python:3.11-slim — builds and runs anywhere, including WSL2
+# without NVIDIA drivers configured, CI, and dev machines.
+#
+# For GPU production (4× RTX 6000 Ada):
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+# which sets:
+#   build:
+#     args:
+#       BASE: nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+#
+# The EmbeddingService and Reranker both check torch.cuda.is_available()
+# and fall back to CPU automatically — no code changes needed between modes.
+ARG BASE=python:3.11-slim
 FROM ${BASE}
 
-# ── System Python ──────────────────────────────────────────────────────────────
+# System dependencies — work on both slim and CUDA base images
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-dev python3-pip \
-    build-essential libpq-dev curl \
-    # OCR + PDF
+    python3-pip build-essential libpq-dev curl \
     tesseract-ocr tesseract-ocr-eng libtesseract-dev \
     poppler-utils libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
     && python3 -m pip install --upgrade pip
 
 WORKDIR /app
@@ -23,15 +27,17 @@ ENV PYTHONPATH=/app \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# ── Python dependencies (layer-cached) ────────────────────────────────────────
-# Install GPU torch FIRST as a separate layer — it's the largest dep (~2GB)
-# and changes rarely. The old requirements-heavy.txt installed the CPU build
-# which then got overridden by the CUDA build in requirements.txt — leaving
-# whichever pip resolved last (non-deterministic). Now it's explicit and ordered.
-COPY backend/requirements-gpu.txt ./backend/
-RUN pip install --no-cache-dir -r backend/requirements-gpu.txt
-
-COPY backend/requirements.txt ./backend/
+# ── Python dependencies ───────────────────────────────────────────────────────
+# requirements-gpu.txt (torch+cu121 ~2GB) is only installed when building
+# with the CUDA base image — it's skipped on python:3.11-slim to keep
+# the default build fast and runnable without NVIDIA drivers.
+COPY backend/requirements-gpu.txt backend/requirements.txt ./backend/
+ARG BASE=python:3.11-slim
+RUN if echo "${BASE}" | grep -q "cuda"; then \
+      pip install --no-cache-dir -r backend/requirements-gpu.txt; \
+    else \
+      pip install --no-cache-dir torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu; \
+    fi
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
 # ── Application ───────────────────────────────────────────────────────────────
