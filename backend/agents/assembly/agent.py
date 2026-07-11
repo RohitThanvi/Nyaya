@@ -34,7 +34,12 @@ _CHUNK_TAG_PATTERN = re.compile(r"\s*<CHUNK:[a-f0-9]{4,8}>", re.IGNORECASE)
 # Matches a sentence ending in a punctuation mark, used to locate and strip
 # the specific sentence containing an unverifiable claim rather than
 # discarding the whole answer.
-_SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+(?=[A-Z\d])")
+_SENTENCE_SPLIT_PATTERN = re.compile(
+    # Split after sentence-ending punctuation followed by whitespace and a
+    # capital letter. Rejects digit-starts so citation numbers like
+    # "AIR 2023 SC 214. The court held" don't split at "2" in "214".
+    r'(?<=[.!?])\s+(?=[A-Z"\'])',
+)
 
 
 class AssemblyAgent:

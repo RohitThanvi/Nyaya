@@ -264,6 +264,7 @@ class BM25Retriever:
         where, params = self._build_pg_filter(
             law_filter, court_filter, year_from, year_to, document_type
         )
+        metadata_filter = f"AND {where}" if where != "TRUE" else ""
         params["query"] = clean
         params["top_k"] = top_k
 
@@ -291,8 +292,8 @@ class BM25Retriever:
                 FROM chunks c
                 JOIN documents d ON c.document_id = d.document_id
                 WHERE
-                    {where}
-                    AND c.content_tsv @@ websearch_to_tsquery('english', :query)
+                    c.content_tsv @@ websearch_to_tsquery('english', :query)
+                    {metadata_filter}
                 ORDER BY bm25_score DESC
                 LIMIT :top_k
             )
@@ -456,17 +457,19 @@ class BM25Retriever:
         year_to: Optional[int],
         document_type: Optional[DocumentType],
     ) -> Tuple[str, Dict[str, Any]]:
-        conditions = ["c.content_tsv IS NOT NULL"]
+        # content_tsv @@ websearch_to_tsquery(...) is always the first condition —
+        # it drives the GIN index seek. The old first condition was
+        # "c.content_tsv IS NOT NULL" which is always true (content_tsv is a
+        # GENERATED STORED column, never null) and forces a full partition scan
+        # before the GIN index can fire. At 100M rows that's the difference
+        # between microseconds (GIN seek) and seconds (full scan).
+        # The @@ condition is added by the caller; we just build the metadata filters.
+        conditions: List[str] = []
         params: Dict[str, Any] = {}
         if law_filter:
             law_vals = [l.value for l in law_filter]
-            # BOTH conditions are required:
-            # - d.law = ANY(...): filters documents table (index scan on documents)
-            # - c.law = ANY(...): allows Postgres to prune chunks partitions at
-            #   query planning time. Without c.law in WHERE, the planner cannot
-            #   eliminate partitions even though the JOIN result would be the same
-            #   — it must scan ALL partitions then join + filter, negating the
-            #   entire benefit of LIST(law) partitioning.
+            # Both d.law and c.law required: d.law filters the documents join,
+            # c.law enables Postgres partition pruning on the chunks table.
             conditions.append("d.law = ANY(:law_filter)")
             conditions.append("c.law = ANY(:law_filter)")
             params["law_filter"] = law_vals
@@ -482,7 +485,8 @@ class BM25Retriever:
         if document_type:
             conditions.append("d.document_type = :document_type")
             params["document_type"] = document_type.value
-        return " AND ".join(conditions), params
+        where = " AND ".join(conditions) if conditions else "TRUE"
+        return where, params
 
     def _row_to_chunk(self, row) -> LegalChunk:
         """Reconstruct LegalChunk from a PostgreSQL row."""

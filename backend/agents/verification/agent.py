@@ -123,20 +123,24 @@ class VerificationAgent:
         self, response_text: str, retrieved_chunks: List[RetrievedChunk],
     ) -> List[str]:
         """
-        Sentence-level grounding check against the actual retrieved source
-        text, independent of citation-pattern matching. Returns flag strings
-        in the same format VerificationAgent's other methods already use
-        ("X could not be verified in the knowledge base. ...") so
-        AssemblyAgent._strip_unverified_claims removes them via its existing
-        regex without needing any change there.
+        LLM-based grounding audit. Skipped for short/conversational answers
+        and answers without specific legal claim indicators (saves 500-1500ms
+        on the majority of queries).
         """
         if not response_text.strip() or not retrieved_chunks:
             return []
 
-        # Strip CHUNK tags before showing the LLM the answer to audit —
-        # they're verification scaffolding, not part of the claim text.
         clean_answer = _CHUNK_TAG_PATTERN.sub("", response_text).strip()
-        if not clean_answer:
+        if len(clean_answer) < 120:
+            return []
+
+        has_claims = bool(
+            re.search(r"\b(?:section|§|article|rule)\s+\d+", clean_answer, re.IGNORECASE) or
+            re.search(r"\b(?:BNS|BNSS|BSA|IPC|CrPC|Constitution)\b", clean_answer) or
+            re.search(r"\b(?:AIR|SCC|SCR)\s+\d{4}\b", clean_answer) or
+            re.search(r"\b\d{1,3}\s+(?:days|months|years|hours)\b", clean_answer, re.IGNORECASE)
+        )
+        if not has_claims:
             return []
 
         sources_text = "\n\n".join(
@@ -146,17 +150,9 @@ class VerificationAgent:
 
         prompt = f"""You are a strict fact-checking system for a legal AI assistant.
 
-Below are the SOURCES that were retrieved to answer a legal question, and the
-ANSWER that was generated from them.
-
-Find every sentence in the ANSWER that makes a specific, checkable legal
-claim (a rule, a requirement, a number, a deadline, a punishment, a
-procedural step, or a case holding) that is NOT actually supported by the
-SOURCES text. Ignore generic framing, disclaimers, or sentences that merely
-say the sources don't cover something.
-
-Return ONLY a JSON array of the exact unsupported sentences, copied verbatim
-from the ANSWER, or [] if every specific claim is supported.
+Find every sentence in the ANSWER that makes a specific, checkable legal claim
+that is NOT supported by the SOURCES. Ignore framing or disclaimers.
+Return ONLY a JSON array of exact unsupported sentences, or [].
 
 SOURCES:
 {sources_text}
@@ -179,7 +175,7 @@ ANSWER:
                     )
             return flags
         except Exception as e:
-            logger.warning(f"Grounding audit failed (non-fatal, continuing without it): {e}")
+            logger.warning(f"Grounding audit failed (non-fatal): {e}")
             return []
 
     # ──────────────────────────────────────────────────────────────────────

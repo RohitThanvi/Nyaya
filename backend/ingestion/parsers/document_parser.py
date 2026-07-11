@@ -333,30 +333,27 @@ class DocumentParser:
     ) -> DocumentMetadata:
         """
         Extract rich metadata from document text using pattern matching.
-        Uses first 3000 chars (header section) for speed.
+        Uses first 3000 chars for court/type/citation (always in header).
+        Uses full text for law detection (judgments often cite BNS mid-body).
         """
         header = text[:3000]
 
-        # Document type
         doc_type = self._detect_document_type(header)
-
-        # Court
         court, court_name = self._detect_court(header)
 
-        # Law
-        law = self._detect_law(text[:5000])
+        # Scan up to 10000 chars for law — Indian court orders commonly
+        # first mention the relevant statute on page 2-3 ("under Section 302
+        # of the BNS"), well past the 5000-char limit that was missing it.
+        law = self._detect_law(text[:10000])
 
-        # Citation
         citation = self._extract_citation(header)
+        year     = self._extract_year(header)
 
-        # Year
-        year = self._extract_year(header)
-
-        # Section references
+        # Extract real keywords from significant legal terms in the document —
+        # NOT section numbers (those are already in section_ref).
+        # Section numbers in `keywords` added zero signal and cluttered the field.
         section_refs = list({m.group(1) for m in _SECTION_PATTERN.finditer(text[:10000])})
-
-        # Keywords from section refs + topic words
-        keywords = section_refs[:10]
+        keywords = self._extract_keywords(text[:5000])
 
         return DocumentMetadata(
             document_type=doc_type,
@@ -369,6 +366,36 @@ class DocumentParser:
             source_url=source_url,
             language="en",
         )
+
+    def _extract_keywords(self, text: str) -> List[str]:
+        """
+        Extract meaningful legal keywords: named parties, constitutional
+        articles, specific legal concepts. Not section numbers.
+        """
+        keywords: List[str] = []
+
+        # Constitutional articles
+        for m in re.finditer(r"\bArticle\s+(\d+[A-Z]?(?:\(\w+\))*)\b", text, re.IGNORECASE):
+            kw = f"Article {m.group(1)}"
+            if kw not in keywords:
+                keywords.append(kw)
+
+        # Legal concepts
+        _LEGAL_TERMS = [
+            "anticipatory bail", "regular bail", "bail application",
+            "writ petition", "habeas corpus", "mandamus", "certiorari",
+            "FIR", "chargesheet", "cognizable", "non-cognizable",
+            "anticipatory arrest", "detention", "remand",
+            "interim order", "stay order", "injunction",
+            "dowry death", "domestic violence", "POCSO",
+            "land acquisition", "compensation", "motor accident",
+        ]
+        lower = text.lower()
+        for term in _LEGAL_TERMS:
+            if term in lower and term not in keywords:
+                keywords.append(term)
+
+        return keywords[:15]
 
     def _detect_document_type(self, text: str) -> DocumentType:
         if re.search(r"\b(?:JUDGMENT|JUDGEMENT|ORDER|DECREE|PETITION)\b", text, re.IGNORECASE):
@@ -389,12 +416,24 @@ class DocumentParser:
         return None, None
 
     def _detect_law(self, text: str) -> Optional[LawCategory]:
+        """
+        Detect the primary law governing this document.
+
+        For multi-law documents (very common for 2023-2025 transitional
+        IPC→BNS judgments), returns the law with the highest mention count.
+        Ties prefer BNS over IPC (more recent statute, more likely primary).
+        """
         counts: Dict[LawCategory, int] = {}
         for law, patterns in _LAW_PATTERNS.items():
             counts[law] = sum(len(p.findall(text)) for p in patterns)
+
         if not any(counts.values()):
             return None
-        return max(counts, key=lambda k: counts[k])
+
+        # Prefer BNS over IPC on tie (common in 2023-2025 transitional period
+        # where both are mentioned but BNS is the operative statute)
+        best = max(counts, key=lambda k: (counts[k], k == LawCategory.BNS))
+        return best if counts[best] > 0 else None
 
     def _extract_citation(self, text: str) -> Optional[str]:
         for pattern in _CITATION_PATTERNS:

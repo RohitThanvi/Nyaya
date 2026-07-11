@@ -242,7 +242,7 @@ class QueryUnderstandingAgent:
                 draft_type_llm = None
         final_draft_type = draft_type_regex or draft_type_llm
 
-        expanded_queries = llm_result.get("expanded_queries", [])[:2]
+        expanded_queries = llm_result.get("expanded_queries", [])[:3]
 
         # Clean query for retrieval
         cleaned_query = query.strip()
