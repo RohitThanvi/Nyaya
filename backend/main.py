@@ -21,6 +21,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from sqlalchemy import text
 
 from backend.api.routes import auth, chat, debug, documents, drafting, health, search, upload
 from backend.config.settings import get_settings
@@ -37,30 +38,48 @@ _cfg = get_settings()
 async def lifespan(app: FastAPI):
     logger.info("NyayaAI starting up...")
 
-    # Warm up embedding model (loads weights into memory once)
+    # ── Schema init ────────────────────────────────────────────────────────
+    # Apply the initial SQL schema on every startup (idempotent: all
+    # CREATE TABLE / CREATE INDEX use IF NOT EXISTS). This means a fresh
+    # container with an empty database gets all tables immediately without
+    # requiring a manual `alembic upgrade head` step. Subsequent Alembic
+    # migrations (0002, 0003, 0004) must still be run manually for existing
+    # deployments, but the base schema is always present.
+    try:
+        from backend.db.session import async_engine
+        import os, pathlib
+        sql_path = pathlib.Path(__file__).parent / "db" / "migrations" / "0001_initial.sql"
+        if sql_path.exists():
+            sql = sql_path.read_text()
+            async with async_engine.begin() as conn:
+                await conn.execute(text(sql))
+            logger.info("Schema init OK (0001_initial.sql applied)")
+    except Exception as e:
+        logger.warning(f"Schema init warning (non-fatal if tables already exist): {e}")
+
+    # ── Warm up embedding model ─────────────────────────────────────────────
     try:
         _get_model()
         logger.info("Embedding model warmed up")
     except Exception as e:
-        logger.error(f"Embedding model warmup failed: {e}")
+        logger.warning(f"Embedding model warmup skipped (non-fatal): {e}")
 
-    # Ensure Qdrant collection exists with correct config
+    # ── Ensure Qdrant collection ────────────────────────────────────────────
     try:
         from backend.retrieval.vector.retriever import VectorRetriever
         vr = VectorRetriever()
         await vr.ensure_collection()
     except Exception as e:
-        logger.warning(f"Qdrant collection check failed (Qdrant may be starting): {e}")
+        logger.warning(f"Qdrant collection check skipped (Qdrant may still be starting): {e}")
 
-    # DB connectivity check
+    # ── DB connectivity check ───────────────────────────────────────────────
     db_ok = await check_db_connection()
     if not db_ok:
         logger.error("Database connection failed at startup — queries will fail")
     else:
         logger.info("Database connection OK")
 
-    logger.info(f"NyayaAI v{_cfg.app.app_version} ready "
-                f"[env={_cfg.app.environment}]")
+    logger.info(f"NyayaAI v{_cfg.app.app_version} ready [env={_cfg.app.environment}]")
     yield
 
     logger.info("NyayaAI shutting down")

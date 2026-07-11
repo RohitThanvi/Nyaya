@@ -1,0 +1,36 @@
+# Production overlay — NVMe bind-mount volumes for 27.1TB machine.
+#
+# Creates the mount directories first:
+#   sudo mkdir -p /mnt/data/{postgres,qdrant,redis,model_cache}
+#   sudo chmod 777 /mnt/data/{postgres,qdrant,redis,model_cache}
+#
+# Usage (full production stack with GPU + NVMe storage):
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.gpu.yml \
+#                  -f docker-compose.prod.yml up -d
+
+volumes:
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/postgres
+  qdrant_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/qdrant
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/redis
+  model_cache:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/model_cache

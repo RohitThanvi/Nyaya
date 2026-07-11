@@ -318,22 +318,6 @@ services:
 
 volumes:
   postgres_data:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/data/postgres      # pin to your fastest NVMe mount
   qdrant_data:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/data/qdrant
   redis_data:
-    driver: local
   model_cache:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/data/model_cache   # models cached on fast NVMe, not re-downloaded
