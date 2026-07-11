@@ -3,6 +3,34 @@
 
 services:
 
+  # ── pgBouncer — connection pooler ────────────────────────────────────────────
+  # At scale: FastAPI pool_size=64 + 48 Celery sync connections = 112 real PG
+  # connections minimum, spiking to 180+ under load. Each idle PG connection
+  # uses ~10MB RAM = 1.8GB just for connection overhead. pgBouncer multiplexes
+  # 1000 client connections into 50 real PG connections (transaction mode),
+  # reducing PG connection memory usage by 94% and removing the connection
+  # saturation risk at millions of documents / thousands of concurrent queries.
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DB_HOST:     pgbouncer
+      DB_PORT:     5432
+      DB_NAME:     ${DB_NAME:-nyaya_ai}
+      DB_USER:     ${DB_USER:-nyaya_user}
+      DB_PASSWORD: ${DB_PASSWORD:-nyaya_pass}
+      POOL_MODE:   transaction
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 50
+      AUTH_TYPE:   md5
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16
@@ -75,7 +103,10 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:            postgres
+      # Route through pgBouncer (transaction pooling) instead of direct Postgres.
+      # pgBouncer multiplexes 1000 client connections → 50 real PG connections.
+      DB_HOST:            pgbouncer
+      DB_PORT:            5432
       QDRANT_HOST:        qdrant
       REDIS_HOST:         redis
       PYTHONPATH:         /app
@@ -91,9 +122,9 @@ services:
     # GPU reservation is in docker-compose.gpu.yml — not here, so the
     # stack starts cleanly in WSL2 / CPU-only environments.
     depends_on:
-      postgres: { condition: service_healthy }
-      qdrant:   { condition: service_healthy }
-      redis:    { condition: service_healthy }
+      pgbouncer: { condition: service_healthy }
+      qdrant:    { condition: service_healthy }
+      redis:     { condition: service_healthy }
     restart: unless-stopped
 
   # ── Frontend (Next.js) ───────────────────────────────────────────────────────
@@ -125,7 +156,7 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:     postgres
+      DB_HOST:     pgbouncer
       QDRANT_HOST: qdrant
       REDIS_HOST:  redis
       PYTHONPATH:  /app
@@ -147,7 +178,7 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:              postgres
+      DB_HOST:              pgbouncer
       QDRANT_HOST:          qdrant
       REDIS_HOST:           redis
       PYTHONPATH:           /app
@@ -173,7 +204,7 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:              postgres
+      DB_HOST:              pgbouncer
       QDRANT_HOST:          qdrant
       REDIS_HOST:           redis
       PYTHONPATH:           /app
@@ -199,7 +230,7 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:              postgres
+      DB_HOST:              pgbouncer
       QDRANT_HOST:          qdrant
       REDIS_HOST:           redis
       PYTHONPATH:           /app
@@ -225,7 +256,7 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:              postgres
+      DB_HOST:              pgbouncer
       QDRANT_HOST:          qdrant
       REDIS_HOST:           redis
       PYTHONPATH:           /app
@@ -252,7 +283,7 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:     postgres
+      DB_HOST:     pgbouncer
       QDRANT_HOST: qdrant
       REDIS_HOST:  redis
       PYTHONPATH:  /app
@@ -274,7 +305,7 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:    postgres
+      DB_HOST:    pgbouncer
       REDIS_HOST: redis
       PYTHONPATH: /app
     command: >
@@ -290,7 +321,7 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:    postgres
+      DB_HOST:    pgbouncer
       REDIS_HOST: redis
       PYTHONPATH: /app
     command: >

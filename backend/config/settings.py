@@ -56,27 +56,27 @@ class QdrantSettings(BaseSettings):
     grpc_port:         int  = Field(default=6334)
     api_key:           Optional[str] = Field(default=None)
     collection_name:   str  = Field(default="nyaya_legal_chunks")
+    # Alias used by all search/upsert operations — points to the active
+    # collection. During a zero-downtime index rebuild, a new collection is
+    # built alongside the live one and the alias is atomically swapped.
+    collection_alias:  str  = Field(default="nyaya_active")
     vector_size:       int  = Field(default=1024)
     distance:          str  = Field(default="Cosine")
-    # m=32 (was 16): more edges per node = better recall at million-scale.
-    # ef_construct=400 (was 200): more candidates during index build = better
-    # index quality. One-time cost at ingestion, pays off on every query.
     hnsw_m:            int  = Field(default=32)
     hnsw_ef_construct: int  = Field(default=400)
-    # ef=256 at query time: larger beam = higher recall, 512GB RAM means no
-    # reason to compromise here — latency stays sub-10ms with RAM-resident index.
     hnsw_ef:           int  = Field(default=256)
-    # 512GB RAM — keep everything in memory. on_disk_payload=False means
-    # payloads (chunk text, metadata) are RAM-resident, not mmap'd from disk.
-    # on_disk_vectors=False means the vector index itself is in RAM.
-    # At 50M chunks × 1024 dim × 4 bytes = ~200GB vectors + ~100GB payloads
-    # = ~300GB total, well within 512GB with room for PG + app overhead.
     on_disk_payload:   bool = Field(default=False)
     on_disk_vectors:   bool = Field(default=False)
-    # Scalar quantization: compress vectors from float32 → int8 in RAM
-    # (4× memory reduction with <1% recall loss). Keeps the full corpus
-    # in memory even as it grows past 200M chunks.
     scalar_quantization: bool = Field(default=True)
+    # Sharding: number of shards for the collection. Each shard is an
+    # independent HNSW index. At 50M+ vectors, 4 shards means each shard
+    # holds ~12.5M vectors — HNSW segment rebuilds are parallelised across
+    # shards instead of blocking the entire collection. Shard count is set
+    # at collection creation time and cannot be changed without a rebuild.
+    shard_number:      int  = Field(default=4)
+    # Replication factor: 1 = no replication (single node). Set to 2+ when
+    # running a Qdrant cluster for high availability.
+    replication_factor: int = Field(default=1)
 
 
 class RedisSettings(BaseSettings):

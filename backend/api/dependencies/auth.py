@@ -114,3 +114,7 @@ def require_role(*roles: UserRole):
             )
         return user
     return _check
+
+
+# Convenience alias for admin-only routes
+require_admin = require_role(UserRole.ADMIN)

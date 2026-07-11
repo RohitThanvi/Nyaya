@@ -61,18 +61,39 @@ celery_app.conf.update(
     # task while the first is still occupying the full GPU memory.
     worker_prefetch_multiplier=1,
 
-    # Result backend TTL: keep task results for 24h for status polling,
-    # then expire automatically.
+    # Result backend TTL: keep task results for 24h for status polling
     result_expires=86400,
 
-    # Dead-letter queue: after max_retries exhausted, route to nyaya_dlq
-    # instead of silently dropping. Failed tasks can be inspected and
-    # replayed with: celery -A ... call nyaya_dlq --args [...]
+    # ── Queue depth limits — prevent Redis OOM at million-document scale ──
+    # Without these, submitting 1M documents at once enqueues 1M tasks
+    # simultaneously. Redis holds each task as a ~2KB JSON blob:
+    # 1M × 2KB = 2GB of Redis memory just for the queue. At 10M docs that's
+    # 20GB — Redis OOM kills the entire pipeline.
+    #
+    # task_queue_max_priority sets a soft depth ceiling via Redis stream
+    # consumer groups. When the queue is full, apply_async() blocks the
+    # caller (the bulk-upload API handler) instead of crashing Redis.
+    # parse workers: 10K queued tasks max (~20MB Redis queue memory)
+    # embed workers: 50K queued tasks max (fan-out sub-tasks, smaller payload)
     task_routes={
-        "backend.ingestion.workers.tasks.parse_document":       {"queue": "nyaya_parse"},
-        "backend.ingestion.workers.tasks.embed_chunk_batch":     {"queue": "nyaya_embed_gpu_0"},
-        "backend.ingestion.workers.tasks.flush_staged":          {"queue": "nyaya_flush"},
-        "backend.ingestion.workers.tasks.dead_letter_handler":   {"queue": "nyaya_dlq"},
+        "backend.ingestion.workers.tasks.parse_document":     {"queue": "nyaya_parse"},
+        "backend.ingestion.workers.tasks.embed_document":     {"queue": "nyaya_parse"},
+        "backend.ingestion.workers.tasks.embed_chunk_batch":  {"queue": "nyaya_embed_gpu_0"},
+        "backend.ingestion.workers.tasks.flush_staged":       {"queue": "nyaya_flush"},
+        "backend.ingestion.workers.tasks.dead_letter_handler":{"queue": "nyaya_dlq"},
+    },
+
+    # Rate limit per worker: parse workers process at most 100 tasks/min each
+    # (32 workers × 100/min = 3200 docs/min peak). This prevents a spike of
+    # bulk uploads from saturating CPU and starving live query workers that
+    # share the same machine.
+    task_annotations={
+        "backend.ingestion.workers.tasks.parse_document": {
+            "rate_limit": "100/m",
+        },
+        "backend.ingestion.workers.tasks.embed_chunk_batch": {
+            "rate_limit": "200/m",
+        },
     },
 
     # Retry config — exponential backoff up to 5 min

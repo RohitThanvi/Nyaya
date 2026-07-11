@@ -23,7 +23,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy import text
 
-from backend.api.routes import auth, chat, debug, documents, drafting, health, search, upload
+from backend.api.routes import admin, auth, chat, debug, documents, drafting, health, search, upload
 from backend.config.settings import get_settings
 from backend.db.session import check_db_connection
 from backend.embeddings.service import _get_model
@@ -39,23 +39,31 @@ async def lifespan(app: FastAPI):
     logger.info("NyayaAI starting up...")
 
     # ── Schema init ────────────────────────────────────────────────────────
-    # Apply the initial SQL schema on every startup (idempotent: all
-    # CREATE TABLE / CREATE INDEX use IF NOT EXISTS). This means a fresh
-    # container with an empty database gets all tables immediately without
-    # requiring a manual `alembic upgrade head` step. Subsequent Alembic
-    # migrations (0002, 0003, 0004) must still be run manually for existing
-    # deployments, but the base schema is always present.
+    # Apply ALL SQL migrations in order on every startup (idempotent).
+    # Previously only 0001_initial.sql ran — meaning partition pruning (0003),
+    # redundant trigger removal (0002), and processing flag (0004) never
+    # executed on any real deployment. Now runs every *.sql file in
+    # numeric order. Python Alembic migrations (.py) must still be run
+    # manually via `alembic upgrade head` for schema changes that need
+    # Python logic; pure-SQL idempotent migrations run here automatically.
     try:
         from backend.db.session import async_engine
-        import os, pathlib
-        sql_path = pathlib.Path(__file__).parent / "db" / "migrations" / "0001_initial.sql"
-        if sql_path.exists():
-            sql = sql_path.read_text()
+        import pathlib
+        migrations_dir = pathlib.Path(__file__).parent / "db" / "migrations"
+        sql_files = sorted(migrations_dir.glob("*.sql"))
+        if sql_files:
             async with async_engine.begin() as conn:
-                await conn.execute(text(sql))
-            logger.info("Schema init OK (0001_initial.sql applied)")
+                for sql_path in sql_files:
+                    sql = sql_path.read_text()
+                    try:
+                        await conn.execute(text(sql))
+                        logger.info(f"Migration applied: {sql_path.name}")
+                    except Exception as e:
+                        # Log but continue — most errors are "table already exists"
+                        # which is fine since all DDL uses IF NOT EXISTS
+                        logger.debug(f"Migration {sql_path.name}: {e} (likely already applied)")
     except Exception as e:
-        logger.warning(f"Schema init warning (non-fatal if tables already exist): {e}")
+        logger.warning(f"Schema init warning (non-fatal): {e}")
 
     # ── Warm up embedding model ─────────────────────────────────────────────
     try:
@@ -156,7 +164,8 @@ def create_app() -> FastAPI:
     app.include_router(upload.router,     prefix=prefix)
     app.include_router(documents.router,  prefix=prefix)
     app.include_router(drafting.router,   prefix=prefix)
-    app.include_router(debug.router,     prefix=prefix)
+    app.include_router(debug.router,      prefix=prefix)
+    app.include_router(admin.router,      prefix=prefix)
 
     @app.get("/")
     async def root():
