@@ -54,8 +54,7 @@ _LAW_DISPLAY = {
 _PRIORITY_TYPES = {
     ChunkType.SECTION,
     ChunkType.FINAL_ORDER,
-    ChunkType.HOLDING,
-    ChunkType.HEADNOTE,
+    ChunkType.SUBSECTION,
 }
 
 # Content similarity threshold: chunks whose first 200 chars are identical
