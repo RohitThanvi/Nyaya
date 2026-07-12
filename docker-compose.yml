@@ -25,7 +25,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 5432 || exit 1"]
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/5432' && echo ok || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -71,7 +71,6 @@ services:
       QDRANT__LOG_LEVEL: "INFO"
       QDRANT__STORAGE__ON_DISK_PAYLOAD: "false"    # keep payloads in 512GB RAM
     # Give Qdrant access to as much RAM as it needs — 300GB budget for vectors+payloads
-    mem_limit: 300g
     healthcheck:
       test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/6333' && exit 0 || exit 1"]
       interval: 10s
@@ -89,7 +88,6 @@ services:
       - ./infra/docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
     ports:
       - "6379:6379"
-    mem_limit: 34g
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
