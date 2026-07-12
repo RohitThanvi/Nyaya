@@ -239,10 +239,55 @@ async def get_document_chunks(
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(document_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
+    """
+    Delete a document and purge its vectors from Qdrant.
+
+    Postgres cascade handles chunks/staged_chunks. Qdrant must be
+    cleaned explicitly — without this, deleted document vectors stay in
+    the ANN index forever, poisoning every semantic search with ghost
+    results from documents the user explicitly removed.
+    """
+    # Verify exists before deleting
+    row = await db.execute(
+        text("SELECT document_id FROM documents WHERE document_id = :doc_id"),
+        {"doc_id": document_id}
+    )
+    if not row.fetchone():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Collect chunk IDs before cascade delete removes them
+    chunk_rows = await db.execute(
+        text("SELECT chunk_id FROM chunks WHERE document_id = :doc_id"),
+        {"doc_id": document_id}
+    )
+    chunk_ids = [str(r.chunk_id) for r in chunk_rows.fetchall()]
+
+    # Delete from Postgres (cascade removes chunks + staged_chunks)
+    await db.execute(
         text("DELETE FROM documents WHERE document_id = :doc_id"),
         {"doc_id": document_id}
     )
     await db.commit()
-    if result.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Purge from Qdrant — non-fatal: log and continue if Qdrant is unavailable
+    if chunk_ids:
+        try:
+            from backend.retrieval.vector.retriever import VectorRetriever
+            from qdrant_client.models import PointIdsList
+            vr = VectorRetriever()
+            client = vr._get_client()
+            await client.delete(
+                collection_name=vr._search_target(),
+                points_selector=PointIdsList(points=chunk_ids),
+                wait=False,
+            )
+            logger.info(
+                f"Deleted {len(chunk_ids)} vectors from Qdrant "
+                f"for document {document_id}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Qdrant vector deletion failed for document {document_id}: {e}. "
+                f"Postgres rows deleted successfully. Run admin/qdrant/rebuild "
+                f"to clean orphaned vectors if this error persists."
+            )

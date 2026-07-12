@@ -235,15 +235,16 @@ class AgentState(BaseModel):
     query_understanding: Optional[QueryUnderstanding] = None
     retrieved_chunks:    List[RetrievedChunk] = Field(default_factory=list)
     reranked_chunks:     List[RetrievedChunk] = Field(default_factory=list)
-    # Output of LegalMappingAgent — chunks that survived its pre-generation
-    # validation (citation_chunk_id or section_ref actually present in
-    # reranked_chunks). When populated, _step_compress uses THIS set instead
-    # of the raw reranked_chunks, so the LLM never even sees a chunk the
-    # mapper already determined was irrelevant or improperly cited —
-    # shrinking the hallucination surface before generation, not just
-    # catching it after.
     mapped_sections:     Optional[Dict[str, Any]] = None
     compressed_context:  Optional[str] = None
+    # Explicit search filters from the API request — stored here so they
+    # survive the understand→retrieve gap. QU may also extract filters from
+    # the query text, but explicit user-provided filters always take precedence.
+    explicit_law_filter:       Optional[List[Any]] = None
+    explicit_court_filter:     Optional[List[Any]] = None
+    explicit_year_from:        Optional[int]       = None
+    explicit_year_to:          Optional[int]       = None
+    explicit_document_type:    Optional[Any]       = None
     citations:           List[Citation] = Field(default_factory=list)
     verified_citations:  List[Citation] = Field(default_factory=list)
     raw_llm_response:    Optional[str]  = None

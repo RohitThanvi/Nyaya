@@ -201,9 +201,20 @@ class AgentPipeline:
     async def run_search(self, request: SearchRequest) -> LegalResponse:
         state = AgentState(
             original_query=request.query,
+            explicit_law_filter=request.law_filter,
+            explicit_court_filter=request.court_filter,
+            explicit_year_from=request.year_from,
+            explicit_year_to=request.year_to,
+            explicit_document_type=request.document_type,
         )
-        await self._step_understand(state, law_filter=request.law_filter,
-                                    court_filter=request.court_filter)
+        await self._step_understand(
+            state,
+            law_filter=request.law_filter,
+            court_filter=request.court_filter,
+            year_from=request.year_from,
+            year_to=request.year_to,
+            document_type=request.document_type,
+        )
         await self._step_retrieve(state)
         await self._step_map(state)
         await self._step_compress(state)
@@ -484,17 +495,34 @@ class AgentPipeline:
             if qu and qu.expanded_queries:
                 queries = [state.original_query] + qu.expanded_queries[:2]
 
+            # Merge filters: explicit user-provided filters take precedence over
+            # LLM-extracted ones. This fixes the bug where run_search passed
+            # year_from/year_to/document_type but they were silently dropped
+            # because _step_understand only forwarded them to qua.understand()
+            # which only stored law_filter/court_filter on QueryUnderstanding.
+            law_filter    = state.explicit_law_filter    or (qu.law_filter    if qu else None)
+            court_filter  = state.explicit_court_filter  or (qu.court_filter  if qu else None)
+            year_from     = state.explicit_year_from     or (qu.year_range.get("from") if qu and qu.year_range else None)
+            year_to       = state.explicit_year_to       or (qu.year_range.get("to")   if qu and qu.year_range else None)
+            document_type = state.explicit_document_type
+
+            retrieve_kwargs = dict(
+                query_understanding=qu,
+                top_k_final=self._ret_cfg.final_context_k,
+                law_filter=law_filter,
+                court_filter=court_filter,
+                year_from=year_from,
+                year_to=year_to,
+                document_type=document_type,
+            )
+
             if len(queries) > 1:
                 chunks, timings = await self._retriever.retrieve_multi_query(
-                    queries=queries,
-                    query_understanding=qu,
-                    top_k_final=self._ret_cfg.final_context_k,
+                    queries=queries, **retrieve_kwargs,
                 )
             else:
                 chunks, timings = await self._retriever.retrieve(
-                    query=state.original_query,
-                    query_understanding=qu,
-                    top_k_final=self._ret_cfg.final_context_k,
+                    query=state.original_query, **retrieve_kwargs,
                 )
 
             state.reranked_chunks = chunks
@@ -502,7 +530,10 @@ class AgentPipeline:
             state.pipeline_trace.append({
                 "step": "retrieve",
                 "chunks_retrieved": len(chunks),
-                "timings": timings,
+                "filters": {
+                    "law": [l.value for l in law_filter] if law_filter else None,
+                    "year_from": year_from, "year_to": year_to,
+                },
             })
         except Exception as e:
             logger.error(f"Retrieval failed: {e}")
