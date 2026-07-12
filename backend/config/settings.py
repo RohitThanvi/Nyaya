@@ -169,8 +169,10 @@ class RetrievalSettings(BaseSettings):
 class IngestionSettings(BaseSettings):
     """Distributed ingestion pipeline — tuned for 4x RTX 6000 Ada / 512GB RAM."""
     model_config = SettingsConfigDict(env_prefix="INGEST_", env_file=".env", extra="ignore")
-    celery_broker:  str = Field(default="redis://localhost:6379/1")
-    celery_backend: str = Field(default="redis://localhost:6379/2")
+    # Broker/backend URLs — default to redis service name used in docker-compose.
+    # Override via INGEST_CELERY_BROKER if Redis runs elsewhere.
+    celery_broker:  str = Field(default="redis://redis:6379/1")
+    celery_backend: str = Field(default="redis://redis:6379/2")
     # 32 CPU parse workers: pdfplumber/PyMuPDF is CPU-bound, server-class Xeon
     # with 32+ cores can saturate this without touching the GPUs.
     parser_concurrency:   int = Field(default=32)

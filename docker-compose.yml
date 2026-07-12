@@ -25,10 +25,11 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 || exit 1"]
+      test: ["CMD-SHELL", "nc -z localhost 5432 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
@@ -156,10 +157,12 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:     pgbouncer
-      QDRANT_HOST: qdrant
-      REDIS_HOST:  redis
-      PYTHONPATH:  /app
+      DB_HOST:               pgbouncer
+      QDRANT_HOST:           qdrant
+      REDIS_HOST:            redis
+      PYTHONPATH:            /app
+      INGEST_CELERY_BROKER:  redis://redis:6379/1
+      INGEST_CELERY_BACKEND: redis://redis:6379/2
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_parse -c 32 --loglevel=info -n parser@%h
@@ -182,6 +185,8 @@ services:
       QDRANT_HOST:          qdrant
       REDIS_HOST:           redis
       PYTHONPATH:           /app
+      INGEST_CELERY_BROKER:  redis://redis:6379/1
+      INGEST_CELERY_BACKEND: redis://redis:6379/2
       CUDA_VISIBLE_DEVICES: "0"
       EMBEDDING_DEVICE:     cpu
       EMBEDDING_BATCH_SIZE: "32"
@@ -208,6 +213,8 @@ services:
       QDRANT_HOST:          qdrant
       REDIS_HOST:           redis
       PYTHONPATH:           /app
+      INGEST_CELERY_BROKER:  redis://redis:6379/1
+      INGEST_CELERY_BACKEND: redis://redis:6379/2
       CUDA_VISIBLE_DEVICES: "1"
       EMBEDDING_DEVICE:     cpu
       EMBEDDING_BATCH_SIZE: "32"
@@ -234,6 +241,8 @@ services:
       QDRANT_HOST:          qdrant
       REDIS_HOST:           redis
       PYTHONPATH:           /app
+      INGEST_CELERY_BROKER:  redis://redis:6379/1
+      INGEST_CELERY_BACKEND: redis://redis:6379/2
       CUDA_VISIBLE_DEVICES: "2"
       EMBEDDING_DEVICE:     cpu
       EMBEDDING_BATCH_SIZE: "32"
@@ -260,6 +269,8 @@ services:
       QDRANT_HOST:          qdrant
       REDIS_HOST:           redis
       PYTHONPATH:           /app
+      INGEST_CELERY_BROKER:  redis://redis:6379/1
+      INGEST_CELERY_BACKEND: redis://redis:6379/2
       CUDA_VISIBLE_DEVICES: "3"
       EMBEDDING_DEVICE:     cpu
       EMBEDDING_BATCH_SIZE: "32"
@@ -308,6 +319,8 @@ services:
       DB_HOST:    pgbouncer
       REDIS_HOST: redis
       PYTHONPATH: /app
+      INGEST_CELERY_BROKER:  redis://redis:6379/1
+      INGEST_CELERY_BACKEND: redis://redis:6379/2
     command: >
       celery -A backend.ingestion.workers.celery_app beat
       --loglevel=info
@@ -324,6 +337,8 @@ services:
       DB_HOST:    pgbouncer
       REDIS_HOST: redis
       PYTHONPATH: /app
+      INGEST_CELERY_BROKER:  redis://redis:6379/1
+      INGEST_CELERY_BACKEND: redis://redis:6379/2
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_dlq -c 1 --loglevel=warning -n dlq@%h
