@@ -13,7 +13,7 @@ services:
   pgbouncer:
     image: edoburu/pgbouncer:latest
     environment:
-      DB_HOST:     pgbouncer
+      DB_HOST:     postgres
       DB_PORT:     5432
       DB_NAME:     ${DB_NAME:-nyaya_ai}
       DB_USER:     ${DB_USER:-nyaya_user}
@@ -21,15 +21,9 @@ services:
       POOL_MODE:   transaction
       MAX_CLIENT_CONN: 1000
       DEFAULT_POOL_SIZE: 50
-      AUTH_TYPE:   md5
+      AUTH_TYPE:   plain
     depends_on:
       postgres: { condition: service_healthy }
-    healthcheck:
-      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/5432' && echo ok || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
     restart: unless-stopped
 
   # ── PostgreSQL ──────────────────────────────────────────────────────────────
@@ -121,8 +115,8 @@ services:
     # GPU reservation is in docker-compose.gpu.yml — not here, so the
     # stack starts cleanly in WSL2 / CPU-only environments.
     depends_on:
-      pgbouncer: { condition: service_healthy }
-      qdrant:    { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      qdrant:   { condition: service_healthy }
       redis:     { condition: service_healthy }
     restart: unless-stopped
 
@@ -168,8 +162,9 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      postgres: { condition: service_healthy }
-      redis:    { condition: service_healthy }
+      postgres:  { condition: service_healthy }
+      pgbouncer: { condition: service_started }
+      redis:     { condition: service_healthy }
     restart: unless-stopped
 
   # ── Celery: GPU embed workers — one per GPU ───────────────────────────────────
