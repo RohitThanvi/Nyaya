@@ -287,10 +287,12 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      DB_HOST:     pgbouncer
-      QDRANT_HOST: qdrant
-      REDIS_HOST:  redis
-      PYTHONPATH:  /app
+      DB_HOST:               pgbouncer
+      QDRANT_HOST:           qdrant
+      REDIS_HOST:            redis
+      PYTHONPATH:            /app
+      INGEST_CELERY_BROKER:  redis://redis:6379/1
+      INGEST_CELERY_BACKEND: redis://redis:6379/2
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_flush -c 1 --loglevel=info -n flusher@%h
@@ -345,10 +347,13 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment:
-      PYTHONPATH: /app
+      PYTHONPATH:            /app
+      INGEST_CELERY_BROKER:  redis://redis:6379/1
+      INGEST_CELERY_BACKEND: redis://redis:6379/2
+      CELERY_BROKER_URL:     redis://redis:6379/1
     command: >
       celery -A backend.ingestion.workers.celery_app flower
-      --port=5555
+      --port=5555 --broker=redis://redis:6379/1
     ports:
       - "5555:5555"
     depends_on: [redis]

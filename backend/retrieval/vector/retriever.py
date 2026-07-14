@@ -27,7 +27,7 @@ from backend.models.domain import (
 
 logger = logging.getLogger(__name__)
 
-_RETRIEVAL_PATH = RetrievalPath.VECTOR_ANN.value
+_RETRIEVAL_PATH = RetrievalPath.VECTOR.value
 
 
 class VectorRetriever:
