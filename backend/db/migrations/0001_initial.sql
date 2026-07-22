@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     page_number    INTEGER,
     section_ref    VARCHAR(50),
     subsection_ref VARCHAR(100),
+    law            VARCHAR(50) NOT NULL DEFAULT 'other',
     content_tsv    TSVECTOR,
     created_at     TIMESTAMPTZ DEFAULT NOW()
 );

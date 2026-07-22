@@ -320,27 +320,36 @@ class HybridRetriever:
         queries: List[str],
         query_understanding: Optional[QueryUnderstanding] = None,
         top_k_final: int = 10,
+        law_filter: Optional[List] = None,
+        court_filter: Optional[List] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        document_type: Optional[Any] = None,
     ) -> Tuple[List[RetrievedChunk], Dict[str, float]]:
         """
-        Multi-query retrieval with parallel execution.
+        Multi-query retrieval with parallel execution and filter forwarding.
 
-        Previously ran queries sequentially in a for loop — 3 queries × ~100ms
-        each = 300ms serial latency. Each query is fully independent, so they
-        run concurrently via asyncio.gather, reducing wall time to ~100ms
-        (the slowest single query) regardless of how many queries are expanded.
+        Previously dropped law_filter/court_filter/year_from/year_to/document_type —
+        _step_retrieve passed them via **retrieve_kwargs but the signature didn't
+        accept them, so all search filters were silently ignored on multi-query paths.
         """
         if not queries:
             return [], {}
 
         capped = queries[:3]
 
-        # Run all queries in parallel — they share no state
+        filter_kwargs = dict(
+            query_understanding=query_understanding,
+            top_k_final=top_k_final,
+            law_filter=law_filter,
+            court_filter=court_filter,
+            year_from=year_from,
+            year_to=year_to,
+            document_type=document_type,
+        )
+
         tasks = [
-            self.retrieve(
-                query=q,
-                query_understanding=query_understanding,
-                top_k_final=top_k_final,
-            )
+            self.retrieve(query=q, **filter_kwargs)
             for q in capped
         ]
         results_and_timings = await asyncio.gather(*tasks, return_exceptions=True)

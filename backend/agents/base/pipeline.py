@@ -481,7 +481,8 @@ class AgentPipeline:
                 query=state.original_query, **kwargs
             )
             state.query_understanding = qu
-            state.pipeline_trace.append({"step": "understand", "intent": qu.intent.value})
+            if qu:
+                state.pipeline_trace.append({"step": "understand", "intent": qu.intent.value})
         except Exception as e:
             logger.error(f"QueryUnderstanding failed: {e}")
             state.error = str(e)
