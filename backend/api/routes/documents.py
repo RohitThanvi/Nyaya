@@ -213,6 +213,23 @@ async def summarize_document(
     return result
 
 
+@router.post("/summarize-text")
+async def summarize_raw_text(
+    request: SummarizeRequest,
+    pipeline: AgentPipeline = Depends(get_pipeline),
+):
+    """
+    Summarize raw pasted judgment text with no stored/ingested document.
+    Use /{document_id}/summarize instead for anything already in the corpus.
+    """
+    if not request.text or not request.text.strip():
+        raise HTTPException(status_code=422, detail="text is required for this endpoint")
+    result = await pipeline.run_summarize(request)
+    if "error" in result:
+        raise HTTPException(status_code=422, detail=result["error"])
+    return result
+
+
 @router.get("/{document_id}/chunks")
 async def get_document_chunks(
     document_id: str,

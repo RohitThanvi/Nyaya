@@ -231,6 +231,7 @@ class AgentPipeline:
         state = AgentState(
             original_query=request.message,
             user_id=user_id,
+            explicit_law_filter=request.law_filter,
         )
 
         # Semantic cache check — skip for document-scoped queries (those are
@@ -318,7 +319,11 @@ class AgentPipeline:
         answer is re-chunked into a typing effect so the frontend still
         gets a stream of `str` events — just never an unverified one.
         """
-        state = AgentState(original_query=request.message, user_id=user_id)
+        state = AgentState(
+            original_query=request.message,
+            user_id=user_id,
+            explicit_law_filter=request.law_filter,
+        )
 
         if request.document_id:
             chunks = await self._retriever.retrieve_for_document(
@@ -439,7 +444,16 @@ class AgentPipeline:
     ) -> Dict[str, Any]:
         """
         Full hierarchical summarisation.
-        Fetches ALL chunks (no LIMIT), uses typed chunk routing.
+
+        Two paths:
+        1. document_id — fetches ALL chunks (no LIMIT) for an already-ingested
+           document, uses typed chunk routing (summarize_chunks).
+        2. text — raw pasted judgment text with no stored document. Previously
+           this field existed on SummarizeRequest and summarize_text() (with
+           its full windowing/map/reduce implementation) existed on
+           SummarizationAgent, but nothing ever connected them: this handler
+           hard-required document_id and returned an error otherwise, making
+           summarize_text() completely unreachable dead code.
         """
         from sqlalchemy import text as sql_text
         from backend.models.domain import (
@@ -447,8 +461,15 @@ class AgentPipeline:
         )
 
         document_id = request.document_id
+
         if not document_id:
-            return {"error": "document_id required for summarisation"}
+            if not request.text or not request.text.strip():
+                return {"error": "Either document_id or text is required for summarisation"}
+            summary = await self._summarizer.summarize_text(
+                text=request.text,
+                document_id="",
+            )
+            return summary.model_dump()
 
         # Fetch document metadata
         meta_result = await self._db.execute(sql_text("""
