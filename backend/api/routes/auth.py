@@ -13,6 +13,7 @@ and get_current_user, completely separate from backend.api.dependencies.auth
    no guarantee of being applied to the other. Now uses the single
    canonical implementation everywhere.
 """
+import asyncio
 import logging
 import uuid as _uuid
 from datetime import datetime, timezone
@@ -51,6 +52,8 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
 
     new_user_id = str(_uuid.uuid4())
+    loop = asyncio.get_event_loop()
+    hashed = await loop.run_in_executor(None, hash_password, user_data.password)
     await db.execute(text("""
         INSERT INTO users (user_id, email, full_name, role, hashed_password, bar_enrollment, is_active)
         VALUES (:user_id, :email, :full_name, :role, :hashed_password, :bar_enrollment, true)
@@ -59,7 +62,7 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         "email": user_data.email.lower().strip(),
         "full_name": user_data.full_name.strip(),
         "role": user_data.role.value,
-        "hashed_password": hash_password(user_data.password),
+        "hashed_password": hashed,
         "bar_enrollment": user_data.bar_enrollment,
     })
     await db.commit()
@@ -81,7 +84,9 @@ async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
         {"email": credentials.email.lower().strip()},
     )
     user = result.fetchone()
-    if not user or not verify_password(credentials.password, user.hashed_password):
+    loop = asyncio.get_event_loop()
+    pw_ok = await loop.run_in_executor(None, verify_password, credentials.password, user.hashed_password) if user else False
+    if not user or not pw_ok:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")

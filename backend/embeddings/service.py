@@ -43,6 +43,7 @@ class EmbeddingService:
     _model_name: Optional[str] = None
     _verified_dim: Optional[int] = None
     _load_lock = threading.Lock()
+    _async_load_lock: Optional[asyncio.Lock] = None
     _gpu_semaphore: Optional[asyncio.Semaphore] = None
 
     def __init__(self):
@@ -58,6 +59,25 @@ class EmbeddingService:
             limit = get_settings().embedding.max_concurrent_gpu_calls
             cls._gpu_semaphore = asyncio.Semaphore(limit)
         return cls._gpu_semaphore
+
+    @classmethod
+    async def _load_model_once_async(cls):
+        """
+        Async-safe entry point for embed_query/embed_batch. Fast path (model
+        already loaded) is a plain attribute check — no lock, no executor,
+        negligible cost. Only the first-ever call in a process's lifetime
+        pays for the actual load, and it does so in a thread so the event
+        loop keeps serving every other in-flight request meanwhile.
+        """
+        if cls._model is not None:
+            return cls._model
+        if cls._async_load_lock is None:
+            cls._async_load_lock = asyncio.Lock()
+        async with cls._async_load_lock:
+            if cls._model is not None:
+                return cls._model
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, cls._load_model_once)
 
     @classmethod
     def _load_model_once(cls):
@@ -176,7 +196,7 @@ class EmbeddingService:
             except Exception:
                 pass
 
-        model = self._load_model_once()
+        model = await self._load_model_once_async()
         loop = asyncio.get_event_loop()
         async with self._get_gpu_semaphore():
             embedding = await loop.run_in_executor(
@@ -206,7 +226,7 @@ class EmbeddingService:
         """Async batch embed — runs GPU inference in a thread executor."""
         if not texts:
             return []
-        model = self._load_model_once()
+        model = await self._load_model_once_async()
         loop = asyncio.get_event_loop()
         async with self._get_gpu_semaphore():
             embeddings = await loop.run_in_executor(

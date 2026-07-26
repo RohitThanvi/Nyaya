@@ -32,6 +32,7 @@ class Reranker:
     _model = None
     _loaded = False
     _load_lock = threading.Lock()
+    _async_load_lock: Optional[asyncio.Lock] = None
     _gpu_semaphore: Optional[asyncio.Semaphore] = None
 
     def __init__(self):
@@ -43,6 +44,22 @@ class Reranker:
             limit = get_settings().reranker.max_concurrent_gpu_calls
             cls._gpu_semaphore = asyncio.Semaphore(limit)
         return cls._gpu_semaphore
+
+    @classmethod
+    async def _load_model_once_async(cls):
+        """Async-safe entry point — see EmbeddingService._load_model_once_async
+        for the full rationale: offloads the blocking CrossEncoder(...) construction
+        (+ warmup pass) to a thread so the event loop isn't frozen for every other
+        in-flight request while it happens."""
+        if cls._loaded:
+            return cls._model
+        if cls._async_load_lock is None:
+            cls._async_load_lock = asyncio.Lock()
+        async with cls._async_load_lock:
+            if cls._loaded:
+                return cls._model
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, cls._load_model_once)
 
     @classmethod
     def _load_model_once(cls):
@@ -97,7 +114,7 @@ class Reranker:
 
         cfg = get_settings().reranker
         top_k = top_k or cfg.top_k
-        model = self._load_model_once()
+        model = await self._load_model_once_async()
 
         # Exact-match results bypass reranking — pin to top
         exact = [r for r in candidates if r.retrieval_source == RetrievalPath.EXACT_LOOKUP.value]
