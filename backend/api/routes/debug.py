@@ -18,9 +18,10 @@ from backend.agents.context_compression.agent import ContextCompressionAgent
 from backend.api.dependencies.pipeline import get_pipeline
 from backend.config.settings import get_settings
 from backend.db.session import get_db
+from backend.api.dependencies.auth import require_admin
 from backend.models.domain import SearchRequest
 
-router = APIRouter(prefix="/debug", tags=["debug"])
+router = APIRouter(prefix="/debug", tags=["debug"], dependencies=[Depends(require_admin)])
 logger = logging.getLogger(__name__)
 
 

@@ -41,6 +41,7 @@ celery_app = Celery(
     "nyaya_ingestion",
     broker=_cfg.celery_broker,
     backend=_cfg.celery_backend,
+    include=["backend.ingestion.workers.tasks"],
 )
 
 # Per-GPU embed queues — deterministic GPU assignment with no contention
