@@ -106,6 +106,10 @@ services:
       EMBEDDING_DEVICE:   cpu
       EMBEDDING_BATCH_SIZE: 32
       EMBEDDING_FP16:     "false"
+      # Default huggingface_hub read timeout is 10s per chunk — too short for
+      # a ~1.3GB model download over a slow/flaky connection, causing repeated
+      # "Read timed out" + resume cycles on first startup.
+      HF_HUB_DOWNLOAD_TIMEOUT: "120"
     volumes:
       - ./data:/app/data
       - model_cache:/app/data/embeddings/models
@@ -184,6 +188,7 @@ services:
       EMBEDDING_DEVICE:     cpu
       EMBEDDING_BATCH_SIZE: "32"
       EMBEDDING_FP16:       "false"
+      HF_HUB_DOWNLOAD_TIMEOUT: "120"
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_embed_gpu_0 -c 1 --loglevel=info -n embed_gpu0@%h
@@ -212,6 +217,7 @@ services:
       EMBEDDING_DEVICE:     cpu
       EMBEDDING_BATCH_SIZE: "32"
       EMBEDDING_FP16:       "false"
+      HF_HUB_DOWNLOAD_TIMEOUT: "120"
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_embed_gpu_1 -c 1 --loglevel=info -n embed_gpu1@%h
@@ -240,6 +246,7 @@ services:
       EMBEDDING_DEVICE:     cpu
       EMBEDDING_BATCH_SIZE: "32"
       EMBEDDING_FP16:       "false"
+      HF_HUB_DOWNLOAD_TIMEOUT: "120"
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_embed_gpu_2 -c 1 --loglevel=info -n embed_gpu2@%h
@@ -268,6 +275,7 @@ services:
       EMBEDDING_DEVICE:     cpu
       EMBEDDING_BATCH_SIZE: "32"
       EMBEDDING_FP16:       "false"
+      HF_HUB_DOWNLOAD_TIMEOUT: "120"
     command: >
       celery -A backend.ingestion.workers.celery_app worker
       -Q nyaya_embed_gpu_3 -c 1 --loglevel=info -n embed_gpu3@%h
@@ -352,8 +360,8 @@ services:
       INGEST_CELERY_BACKEND: redis://redis:6379/2
       CELERY_BROKER_URL:     redis://redis:6379/1
     command: >
-      celery -A backend.ingestion.workers.celery_app flower
-      --port=5555 --broker=redis://redis:6379/1
+      celery -A backend.ingestion.workers.celery_app --broker=redis://redis:6379/1
+      flower --port=5555
     ports:
       - "5555:5555"
     depends_on: [redis]
