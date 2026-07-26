@@ -114,10 +114,12 @@ async def _run_rebuild():
         # Create new collection with current settings
         from qdrant_client.models import (
             VectorParams, Distance, HnswConfigDiff, OptimizersConfigDiff,
-            ScalarQuantizationConfig, ScalarType, QuantizationConfig,
+            ScalarQuantizationConfig, ScalarType, ScalarQuantization,
         )
         dist = {"Cosine": Distance.COSINE, "Dot": Distance.DOT}.get(cfg.distance, Distance.COSINE)
-        quant = QuantizationConfig(
+        # QuantizationConfig is a typing.Union alias, not a class — see
+        # retriever.py's ensure_collection for the same fix and full explanation.
+        quant = ScalarQuantization(
             scalar=ScalarQuantizationConfig(type=ScalarType.INT8, quantile=0.99, always_ram=True)
         ) if cfg.scalar_quantization else None
 

@@ -241,7 +241,7 @@ class VectorRetriever:
         """
         from qdrant_client.models import (
             VectorParams, Distance, HnswConfigDiff, OptimizersConfigDiff,
-            ScalarQuantizationConfig, ScalarType, QuantizationConfig,
+            ScalarQuantizationConfig, ScalarType, ScalarQuantization,
         )
         cfg = self._cfg
         client = self._get_client()
@@ -256,7 +256,13 @@ class VectorRetriever:
             }
             quantization = None
             if cfg.scalar_quantization:
-                quantization = QuantizationConfig(
+                # QuantizationConfig in qdrant_client is `Union[ScalarQuantization,
+                # ProductQuantization, BinaryQuantization]` — a typing.Union alias,
+                # not a class. Instantiating it directly raises
+                # "TypeError: Cannot instantiate typing.Union", which was getting
+                # swallowed by main.py's startup try/except and silently skipping
+                # collection creation. Instantiate the concrete class instead.
+                quantization = ScalarQuantization(
                     scalar=ScalarQuantizationConfig(
                         type=ScalarType.INT8,
                         quantile=0.99,
