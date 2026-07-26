@@ -36,7 +36,7 @@ Changes from v2 (this revision — zero-hallucination hardening):
 import asyncio
 import logging
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -301,11 +301,22 @@ class AgentPipeline:
 
     async def run_chat_stream(
         self, request: ChatRequest, user_id: Optional[str] = None
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[Union[str, LegalResponse]]:
         """
-        SSE streaming: runs understand + retrieve + compress synchronously,
-        then streams LLM generation token-by-token.
-        Verification runs after stream completes (non-blocking metadata append).
+        SSE streaming: runs the full pipeline (understand → retrieve → map →
+        compress → generate → verify → assemble) exactly like run_chat, so
+        the response is genuinely hallucination-gated before anything is
+        sent to the client.
+
+        This intentionally does NOT forward raw LLM tokens as they're
+        generated — see the class-level note above for why: this project's
+        whole premise is that a claim isn't shown to the user until it's
+        checked against retrieved_chunks, and true token-by-token streaming
+        is fundamentally incompatible with that (you can't verify a
+        sentence, or safely strip its internal <CHUNK:id> tag, before it's
+        finished). Instead, the already-verified, already-stripped final
+        answer is re-chunked into a typing effect so the frontend still
+        gets a stream of `str` events — just never an unverified one.
         """
         state = AgentState(original_query=request.message, user_id=user_id)
 
@@ -322,37 +333,20 @@ class AgentPipeline:
             await self._step_map(state)
 
         await self._step_compress(state)
+        await self._step_generate(state, history=request.history)
+        await self._step_verify(state)
+        result = self._assembler.assemble(state)
+        if request.session_id:
+            result.session_id = request.session_id
 
-        intent = (
-            state.query_understanding.intent.value
-            if state.query_understanding
-            else LegalIntentType.GENERAL_QUERY.value
-        )
-        prompt_template = _PROMPTS.get(intent, _PROMPTS[LegalIntentType.GENERAL_QUERY.value])
-        prompt = prompt_template.format(
-            context=state.compressed_context or "",
-            query=request.message,
-        )
+        # Re-chunk the verified answer into a typing effect. Word-level
+        # (not char-level) keeps the SSE event count reasonable for long
+        # answers while still reading as a live stream on the frontend.
+        words = result.answer.split(" ")
+        for i, word in enumerate(words):
+            yield word if i == 0 else " " + word
 
-        full_response = ""
-        async for token in self._llm.stream(prompt=prompt):
-            full_response += token
-            yield token
-
-        state.raw_llm_response = full_response
-
-        # Async post-stream verification (fire-and-forget for latency)
-        try:
-            verifier = self._make_verifier()
-            verified, flags = await verifier.verify(
-                llm_response=full_response,
-                retrieved_chunks=state.reranked_chunks,
-                original_query=request.message,
-            )
-            state.verified_citations = verified
-            state.hallucination_flags = flags
-        except Exception as e:
-            logger.warning(f"Post-stream verification failed: {e}")
+        yield result
 
     async def run_draft(self, request: DraftRequest) -> LegalResponse:
         state = AgentState(
