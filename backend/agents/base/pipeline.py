@@ -260,6 +260,12 @@ class AgentPipeline:
                     from backend.models.domain import LegalResponse as LR
                     cached.pop("_cache_hit", None)
                     cached.pop("_cache_similarity", None)
+                    # The cache is matched on semantic similarity, not exact
+                    # text — the cached entry's `query` field is whatever was
+                    # originally asked, which can be worded differently from
+                    # what THIS user just typed. Always reflect their actual
+                    # input back, not a stale semantically-similar one.
+                    cached["query"] = request.message
                     return LR(**cached)
             except Exception as e:
                 logger.warning(f"Semantic cache lookup failed (continuing without cache): {e}")

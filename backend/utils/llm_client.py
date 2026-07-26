@@ -4,7 +4,6 @@ LLM Client v2 — unified interface used by all agents.
 complete()           — non-streaming, returns str
 complete_with_json() — non-streaming, returns parsed dict (used by QUA + LegalMapping)
 complete_messages()  — non-streaming, takes messages list directly
-stream()             — async generator, yields str tokens
 
 get_llm_client()     — module-level singleton factory (used by old agents)
 """
@@ -61,6 +60,15 @@ class LLMClient:
         if self._cfg.provider == "openai":
             return self._cfg.openai_model
         return self._cfg.ollama_model
+
+    # NOTE: no stream() method here. One used to exist (raw token-by-token
+    # generator via the chat completions streaming API) but is deliberately
+    # not offered anymore: run_chat_stream used to call it directly and
+    # forward tokens straight to the client, completely bypassing
+    # VerificationAgent/AssemblyAgent's hallucination-gating (see pipeline.py
+    # history). If a future feature genuinely needs live token-by-token
+    # output, it needs its own verify-before-send design — copying this
+    # method's old shape would silently reintroduce that bug.
 
     # ── Core: messages list ────────────────────────────────────────────────
 
@@ -180,50 +188,3 @@ class LLMClient:
 
         logger.warning(f"Could not parse JSON from LLM response: {raw[:200]}")
         return {}
-
-    # ── stream() — async generator for SSE ────────────────────────────────
-
-    async def stream(
-        self,
-        prompt: str,
-        temperature: float = None,
-        system: Optional[str] = None,
-    ) -> AsyncIterator[str]:
-        temp = temperature if temperature is not None else self._cfg.temperature
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
-        last_exc = None
-        for attempt in range(self._cfg.max_retries):
-            try:
-                client = self._get_client()
-                stream = await asyncio.wait_for(
-                    client.chat.completions.create(
-                        model=self._model(),
-                        messages=messages,
-                        temperature=temp,
-                        max_tokens=self._cfg.max_tokens,
-                        stream=True,
-                    ),
-                    timeout=self._cfg.timeout,
-                )
-                async for chunk in stream:
-                    delta = chunk.choices[0].delta.content
-                    if delta:
-                        yield delta
-                return  # clean exit
-            except asyncio.TimeoutError:
-                last_exc = asyncio.TimeoutError("LLM stream timed out")
-                logger.warning(f"LLM stream timeout attempt {attempt + 1}")
-            except Exception as e:
-                last_exc = e
-                logger.warning(f"LLM stream error attempt {attempt + 1}: {e}")
-
-            if attempt < self._cfg.max_retries - 1:
-                backoff = min(2 ** attempt, 30)
-                await asyncio.sleep(backoff)
-
-        logger.error(f"LLM stream failed after {self._cfg.max_retries} retries: {last_exc}")
-        yield f"\n\n[Response unavailable — please retry. Error: {last_exc}]"
