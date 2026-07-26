@@ -1,86 +1,45 @@
 """
-Auth route v2 — fixes refresh_token from query param to request body.
+Auth route v3 — consolidated onto the canonical auth implementation.
+
+FIX: this file used to maintain its own bcrypt hashing, JWT encode/decode,
+and get_current_user, completely separate from backend.api.dependencies.auth
+(which every other route in the app actually depends on). Two problems:
+1. This local _hash_password/_verify_password never truncated to bcrypt's
+   72-byte hard limit — confirmed against the pinned bcrypt version that
+   hashing a >72-byte password raises an unhandled ValueError, so any user
+   with a longer passphrase got a raw 500 on /register and /login.
+2. Two independent copies of security-critical logic is a real hazard: a
+   fix applied to one (e.g. an inactive-user check, a lockout policy) has
+   no guarantee of being applied to the other. Now uses the single
+   canonical implementation everywhere.
 """
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+import uuid as _uuid
+from datetime import datetime, timezone
 
-import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.api.dependencies.auth import (
+    create_access_token, create_refresh_token, get_current_user,
+    hash_password, verify_password,
+)
 from backend.config.settings import get_settings
 from backend.db.session import get_db
-from backend.models.domain import TokenPayload, TokenResponse, UserCreate, UserLogin
+from backend.models.domain import TokenResponse, UserCreate, UserLogin, UserInDB
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 _cfg = get_settings().auth
-_bearer = HTTPBearer(auto_error=False)
 
 
 class RefreshRequest(BaseModel):
     refresh_token: str
 
-
-def _hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-
-
-def _verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode(), hashed.encode())
-
-
-def _create_token(data: dict, expires_delta: timedelta) -> str:
-    payload = data.copy()
-    payload["exp"] = datetime.now(timezone.utc) + expires_delta
-    return jwt.encode(payload, _cfg.secret_key, algorithm=_cfg.algorithm)
-
-
-def _create_access_token(user_id: str, role: str) -> str:
-    return _create_token(
-        {"sub": user_id, "role": role, "type": "access"},
-        timedelta(minutes=_cfg.access_token_expire_minutes),
-    )
-
-
-def _create_refresh_token(user_id: str) -> str:
-    return _create_token(
-        {"sub": user_id, "type": "refresh"},
-        timedelta(days=_cfg.refresh_token_expire_days),
-    )
-
-
-async def get_current_user(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
-    db: AsyncSession = Depends(get_db),
-) -> dict:
-    if not credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    try:
-        payload = jwt.decode(credentials.credentials, _cfg.secret_key, algorithms=[_cfg.algorithm])
-        user_id = payload.get("sub")
-        if not user_id or payload.get("type") != "access":
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    result = await db.execute(
-        text("SELECT user_id, email, full_name, role, is_active FROM users WHERE user_id = :uid"),
-        {"uid": user_id},
-    )
-    user = result.fetchone()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
-    return {"user_id": str(user.user_id), "email": user.email, "full_name": user.full_name, "role": user.role}
-
-
-import uuid as _uuid
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
@@ -100,14 +59,14 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         "email": user_data.email.lower().strip(),
         "full_name": user_data.full_name.strip(),
         "role": user_data.role.value,
-        "hashed_password": _hash_password(user_data.password),
+        "hashed_password": hash_password(user_data.password),
         "bar_enrollment": user_data.bar_enrollment,
     })
     await db.commit()
 
     return TokenResponse(
-        access_token=_create_access_token(new_user_id, user_data.role.value),
-        refresh_token=_create_refresh_token(new_user_id),
+        access_token=create_access_token(new_user_id, user_data.role.value),
+        refresh_token=create_refresh_token(new_user_id),
         expires_in=_cfg.access_token_expire_minutes * 60,
     )
 
@@ -122,7 +81,7 @@ async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
         {"email": credentials.email.lower().strip()},
     )
     user = result.fetchone()
-    if not user or not _verify_password(credentials.password, user.hashed_password):
+    if not user or not verify_password(credentials.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
@@ -135,15 +94,15 @@ async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):
     await db.commit()
 
     return TokenResponse(
-        access_token=_create_access_token(user_id, user.role),
-        refresh_token=_create_refresh_token(user_id),
+        access_token=create_access_token(user_id, user.role),
+        refresh_token=create_refresh_token(user_id),
         expires_in=_cfg.access_token_expire_minutes * 60,
     )
 
 
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(
-    body: RefreshRequest,          # FIX: was query param, now request body
+    body: RefreshRequest,          # FIX (kept from v2): was query param, now request body
     db: AsyncSession = Depends(get_db),
 ):
     """Exchange refresh token for new access + refresh token pair."""
@@ -164,12 +123,17 @@ async def refresh_token(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
     return TokenResponse(
-        access_token=_create_access_token(user_id, user.role),
-        refresh_token=_create_refresh_token(user_id),
+        access_token=create_access_token(user_id, user.role),
+        refresh_token=create_refresh_token(user_id),
         expires_in=_cfg.access_token_expire_minutes * 60,
     )
 
 
 @router.get("/me")
-async def get_me(current_user: dict = Depends(get_current_user)):
-    return current_user
+async def get_me(current_user: UserInDB = Depends(get_current_user)):
+    return {
+        "user_id": current_user.user_id,
+        "email": current_user.email,
+        "full_name": current_user.full_name,
+        "role": current_user.role.value,
+    }

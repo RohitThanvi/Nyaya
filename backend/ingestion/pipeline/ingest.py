@@ -139,9 +139,10 @@ class IngestionPipeline:
         recursive: bool = True,
         resume: bool = True,
         progress_callback=None,
+        url_manifest: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
-        Bulk-ingest every PDF in a directory with bounded concurrency.
+        Bulk-ingest every supported document in a directory with bounded concurrency.
 
         Previously this ran fully sequentially (one document at a time),
         despite IngestionSettings.parser_concurrency existing in config and
@@ -156,11 +157,19 @@ class IngestionPipeline:
         statements from different logical transactions on the same
         connection). Concurrency is capped at parser_concurrency to stay
         within the DB connection pool size.
+
+        url_manifest: optional {filename_or_relative_path: source_url} map.
+        Most court judgment PDFs in a scraped bulk corpus carry no embedded
+        /URI link annotation (the only source _parse_file can otherwise
+        extract a source_url from), so without this every citation shown to
+        a user would have no working "view source" link for almost the
+        entire dataset. Looked up by basename first, then by path relative
+        to `directory`, so a manifest keyed either way works.
         """
         from backend.db.session import get_db_session
 
         pdf_files = list(self._find_pdfs(directory, recursive))
-        logger.info(f"Found {len(pdf_files)} PDF files in {directory}")
+        logger.info(f"Found {len(pdf_files)} files in {directory}")
 
         existing_ids = set()
         if resume:
@@ -179,14 +188,26 @@ class IngestionPipeline:
         concurrency = max(1, self._cfg.parser_concurrency)
         sem = asyncio.Semaphore(concurrency)
 
+        def _lookup_url(fpath: str, fname: str) -> Optional[str]:
+            if not url_manifest:
+                return None
+            if fname in url_manifest:
+                return url_manifest[fname]
+            try:
+                rel = str(Path(fpath).relative_to(directory))
+            except ValueError:
+                rel = fname
+            return url_manifest.get(rel)
+
         async def _ingest_one(fpath: str) -> None:
             nonlocal total_chunks, total_docs, partial_docs, completed
             fname = os.path.basename(fpath)
+            src_url = _lookup_url(fpath, fname)
             async with sem:
                 try:
                     async with get_db_session() as db:
                         pipeline = IngestionPipeline(db, self._embedder, self._vector)
-                        result = await pipeline.ingest_upload(fpath, fname)
+                        result = await pipeline.ingest_upload(fpath, fname, source_url=src_url)
                     async with lock:
                         total_chunks += result.get("chunks_created", 0)
                         total_docs += 1
@@ -205,6 +226,7 @@ class IngestionPipeline:
 
         await asyncio.gather(*(_ingest_one(f) for f in todo))
 
+        no_source_url = len(todo) - sum(1 for f in todo if _lookup_url(f, os.path.basename(f)))
         return {
             "total_files": len(pdf_files),
             "ingested": total_docs,
@@ -212,6 +234,7 @@ class IngestionPipeline:
             "skipped": skipped_already_indexed,
             "total_chunks": total_chunks,
             "errors": errors,
+            "documents_without_source_url": no_source_url if url_manifest else "unknown (no url_manifest provided)",
         }
 
     # ──────────────────────────────────────────────────────────────────────
@@ -482,11 +505,20 @@ class IngestionPipeline:
     # Utilities
     # ──────────────────────────────────────────────────────────────────────
 
+    # BUG FIX: DocumentParser.parse() dispatches on extension and supports
+    # .pdf, .txt, .docx, and .doc (see document_parser.py:86-92), but this
+    # only globbed *.pdf — so bulk directory ingestion silently dropped every
+    # non-PDF file with no warning at all. For scraped Indian judgment
+    # corpora (eCourts/Indian Kanoon dumps are frequently .txt or .docx),
+    # that could mean a large fraction of a directory never gets ingested.
+    _SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".docx", ".doc")
+
     def _find_pdfs(self, directory: str, recursive: bool) -> Iterator[str]:
         base = Path(directory)
-        pattern = "**/*.pdf" if recursive else "*.pdf"
+        pattern = "**/*" if recursive else "*"
         for p in base.glob(pattern):
-            yield str(p)
+            if p.is_file() and p.suffix.lower() in self._SUPPORTED_EXTENSIONS:
+                yield str(p)
 
     async def _get_indexed_filenames(self) -> set:
         try:

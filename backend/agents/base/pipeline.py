@@ -147,20 +147,12 @@ Provide a structured summary using ONLY the excerpts above.
 Structure: Facts | Issues | Holdings | Ratio | Final Order
 For each section, cite the source chunk tag. If an excerpt does not cover a section, write "Not available in provided excerpts" — do not invent facts, dates, or names.""",
 
-    LegalIntentType.DRAFTING_REQUEST.value: """You are NyayaAI, an expert Indian legal assistant.
-
-GROUNDING RULES (mandatory):
-1. Use the legal sources below for all section numbers, precedents, and legal standards cited in the draft.
-2. Tag every section number or precedent with its source <CHUNK:xxxxxxxx> tag.
-3. Mark any clause requiring information not present in the sources with [VERIFY: reason].
-4. Never invent section numbers, case citations, or statutory penalties.
-
-LEGAL SOURCES:
-{context}
-
-DRAFTING QUERY: {query}
-
-Complete the draft with accurate legal language. Every cited provision must appear in the sources above.""",
+    # Note: no DRAFTING_REQUEST entry here — run_draft() bypasses
+    # _step_generate/_PROMPTS entirely and calls DraftingAgent.draft()
+    # directly, which has its own grounding prompt (DRAFTING_SYSTEM in
+    # backend/agents/drafting/agent.py). An unused DRAFTING_REQUEST template
+    # used to live here, which falsely implied drafting went through this
+    # dict — removed as dead code.
 }
 
 
@@ -181,6 +173,17 @@ class AgentPipeline:
         self._db              = db
         self._settings        = get_settings()
         self._ret_cfg         = self._settings.retrieval
+
+        # BUG FIX: run_chat's semantic-cache path calls self._embedder.embed_query(),
+        # but this attribute was never assigned anywhere in __init__. Since that
+        # call sits inside a broad try/except ("continuing without cache"), the
+        # resulting AttributeError was silently swallowed on every single chat
+        # request — semantic caching had a real, permanent 0% hit rate, with no
+        # error ever surfaced in logs beyond a generic warning. Reuse the
+        # embedder already loaded inside HybridRetriever (via its public
+        # `embedder` property) rather than instantiating a second EmbeddingService,
+        # which would load the embedding model onto the GPU twice.
+        self._embedder         = retriever.embedder
 
         # Agent instances
         self._qua             = QueryUnderstandingAgent(llm_client=llm_client)
@@ -355,30 +358,85 @@ class AgentPipeline:
         state = AgentState(
             original_query=f"Draft {request.draft_type.value} for: {request.facts[:200]}"
         )
-        draft_text = await self._drafting.generate_draft(request)
+
+        # Ground the draft in real retrieved sources — draft() requires
+        # retrieved_chunks and can't produce a cited draft without them.
+        retrieval_query = request.facts
+        if request.sections_involved:
+            retrieval_query += " " + " ".join(request.sections_involved)
+        try:
+            chunks, timings = await self._retriever.retrieve(
+                query=retrieval_query,
+                top_k_final=self._ret_cfg.final_context_k,
+            )
+            state.reranked_chunks = chunks
+            state.latency_ms.update(timings)
+        except Exception as e:
+            logger.error(f"Draft retrieval failed (continuing with no sources): {e}")
+            state.reranked_chunks = []
+
+        draft_result = await self._drafting.draft(
+            draft_type=request.draft_type,
+            facts=request.facts,
+            parties=request.parties,
+            retrieved_chunks=state.reranked_chunks,
+            court=request.court,
+            additional_context=request.additional_context,
+        )
+        draft_text = draft_result.get("content", "")
         state.raw_llm_response = draft_text
-        draft_confidence = 0.45
+
+        # Verify the drafted content the same way any other answer is
+        # verified, so confidence reflects real grounding instead of a
+        # hardcoded placeholder.
+        verified, flags = [], []
+        if state.reranked_chunks and draft_text:
+            try:
+                verifier = self._make_verifier()
+                verified, flags = await verifier.verify(
+                    llm_response=draft_text,
+                    retrieved_chunks=state.reranked_chunks,
+                    original_query=request.facts,
+                )
+            except Exception as e:
+                logger.error(f"Draft verification failed: {e}")
+
+        total_claims = len(verified) + len(flags)
+        verification_ratio = (len(verified) / total_claims) if total_claims else 0.0
+        draft_confidence = min(0.6, 0.3 + 0.3 * verification_ratio) if state.reranked_chunks else 0.2
+
+        # Same hard enforcement as every other answer path: strip sentences
+        # behind failed verification, then strip internal <CHUNK:id> tags —
+        # run_draft doesn't go through AssemblyAgent.assemble(), so this has
+        # to be called explicitly or CHUNK tags would leak into the document.
+        clean_answer = self._assembler.strip_grounding_artifacts(draft_text, flags)
+
         return LegalResponse(
             query=state.original_query,
             session_id=state.session_id,
             intent=LegalIntentType.DRAFTING_REQUEST.value,
-            answer=draft_text,
+            answer=clean_answer,
             confidence=draft_confidence,
+            hallucination_flags=flags,
             confidence_breakdown={
-                "band": "medium",
+                "band": "medium" if draft_confidence >= 0.4 else "low",
                 "retrieval_quality": 0.0,
-                "chunks_used": 0,
+                "chunks_used": len(state.reranked_chunks),
                 "source_diversity": 0.0,
-                "unique_documents": 0,
-                "verification_ratio": 0.0,
-                "verified_claims": 0,
-                "flagged_claims": 0,
+                "unique_documents": len({
+                    rc.chunk.metadata.document_id for rc in state.reranked_chunks
+                    if rc.chunk.metadata
+                }) if state.reranked_chunks else 0,
+                "verification_ratio": verification_ratio,
+                "verified_claims": len(verified),
+                "flagged_claims": len(flags),
             },
             warnings=[
                 "This draft must be reviewed and verified by a qualified advocate "
                 "before filing or use in any legal proceeding.",
-                "Confidence score reflects that no source verification was performed "
-                "on this draft — advocate review is mandatory.",
+                "A draft is a starting point, not a substitute for legal advice — "
+                "even fully-verified citations do not guarantee the draft fits "
+                "your specific facts.",
             ],
         )
 

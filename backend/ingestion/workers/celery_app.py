@@ -75,10 +75,20 @@ celery_app.conf.update(
     # caller (the bulk-upload API handler) instead of crashing Redis.
     # parse workers: 10K queued tasks max (~20MB Redis queue memory)
     # embed workers: 50K queued tasks max (fan-out sub-tasks, smaller payload)
+    # NOTE: embed_chunk_batch is deliberately NOT statically routed here.
+    # Its whole reason to exist is to be dispatched from embed_document's
+    # round-robin fan-out via apply_async(..., queue=target_queue), which
+    # picks a *different* one of the 4 GPU queues per sub-batch. An
+    # explicit queue= argument to apply_async() takes precedence over
+    # task_routes, so a static entry here would never fire in the normal
+    # flow — but leaving one in place (previously hardcoded to
+    # nyaya_embed_gpu_0) is a landmine: any future caller that invokes
+    # embed_chunk_batch without an explicit queue= (a debug script, a
+    # manual replay helper) would silently pin every job onto GPU 0 while
+    # GPUs 1-3 sit idle, with no error to indicate why throughput cratered.
     task_routes={
         "backend.ingestion.workers.tasks.parse_document":     {"queue": "nyaya_parse"},
         "backend.ingestion.workers.tasks.embed_document":     {"queue": "nyaya_parse"},
-        "backend.ingestion.workers.tasks.embed_chunk_batch":  {"queue": "nyaya_embed_gpu_0"},
         "backend.ingestion.workers.tasks.flush_staged":       {"queue": "nyaya_flush"},
         "backend.ingestion.workers.tasks.dead_letter_handler":{"queue": "nyaya_dlq"},
     },

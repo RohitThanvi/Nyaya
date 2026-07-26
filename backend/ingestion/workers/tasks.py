@@ -7,7 +7,7 @@ Task chain for a single document:
 """
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from backend.ingestion.workers.celery_app import celery_app
 
@@ -384,7 +384,7 @@ def flush_staged() -> Dict[str, Any]:
                     LIMIT  :batch
                     FOR UPDATE SKIP LOCKED
                 )
-                RETURNING chunk_id, embedding, metadata
+                RETURNING chunk_id, document_id, embedding, metadata
             """), {"batch": cfg.flush_batch_size}).fetchall()
             db.commit()
 
@@ -404,6 +404,19 @@ def flush_staged() -> Dict[str, Any]:
         # Step 3: mark as indexed OR release the processing lock on failure
         with get_sync_session() as db:
             if success:
+                # Bump the persistent per-document counter BEFORE deleting
+                # the staged rows — this is the only record that survives
+                # past this point telling the status endpoint how many
+                # chunks are actually indexed (see migration 0005).
+                from collections import Counter
+                doc_counts = Counter(str(r.document_id) for r in claimed)
+                for doc_id, count in doc_counts.items():
+                    db.execute(text("""
+                        UPDATE documents
+                        SET indexed_chunk_count = indexed_chunk_count + :count
+                        WHERE document_id = :doc_id
+                    """), {"count": count, "doc_id": doc_id})
+
                 # Delete flushed rows — Qdrant is now the source of truth.
                 # Keeping them as indexed=true wastes storage and slows scans.
                 db.execute(text("""

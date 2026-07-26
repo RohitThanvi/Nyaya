@@ -78,14 +78,22 @@ async def debug_pipeline(
     try:
         qu = state.query_understanding
         queries = [request.query] + (qu.expanded_queries[:2] if qu else [])
-        chunks, timings = await pipeline._retriever.retrieve(
-            query=request.query,
-            query_understanding=qu,
-            top_k_final=get_settings().retrieval.final_context_k,
-        )
+        if len(queries) > 1:
+            chunks, timings = await pipeline._retriever.retrieve_multi_query(
+                queries=queries,
+                query_understanding=qu,
+                top_k_final=get_settings().retrieval.final_context_k,
+            )
+        else:
+            chunks, timings = await pipeline._retriever.retrieve(
+                query=request.query,
+                query_understanding=qu,
+                top_k_final=get_settings().retrieval.final_context_k,
+            )
         state.reranked_chunks = chunks
         report["steps"]["2_retrieval"] = {
             "status": "ok",
+            "queries_used": queries,
             "chunks_returned": len(chunks),
             "retrieval_timings_ms": {k: round(v, 1) for k, v in timings.items()},
             "chunks": [

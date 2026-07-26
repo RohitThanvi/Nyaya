@@ -114,6 +114,25 @@ class AssemblyAgent:
             retrieval_debug=retrieval_debug,
         )
 
+    def strip_grounding_artifacts(self, answer: str, hallucination_flags: List[str]) -> str:
+        """
+        Public entry point for callers that build a LegalResponse without
+        going through assemble() (currently: AgentPipeline.run_draft) but
+        still need the same hard enforcement — strip unverified-claim
+        sentences, then strip internal <CHUNK:id> tags — rather than
+        re-implementing it or, worse, returning CHUNK tags straight to
+        the advocate reviewing the draft.
+        """
+        answer = self._strip_unverified_claims(answer, hallucination_flags)
+        answer = _CHUNK_TAG_PATTERN.sub("", answer).strip()
+        if not answer:
+            answer = (
+                "I could not produce a draft that was fully supported by the "
+                "retrieved sources. Please check the relevant sections and "
+                "precedents directly, or provide more specific facts."
+            )
+        return answer
+
     def _strip_unverified_claims(self, answer: str, hallucination_flags: List[str]) -> str:
         """
         Removes the specific sentence containing each unverified claim,

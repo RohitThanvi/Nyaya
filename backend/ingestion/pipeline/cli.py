@@ -44,7 +44,7 @@ async def ingest_file(file_path: str, source_url: Optional[str] = None):
         return result
 
 
-async def ingest_directory(directory: str, resume: bool = True):
+async def ingest_directory(directory: str, resume: bool = True, url_manifest_path: Optional[str] = None):
     from backend.db.session import get_db_session
     from backend.embeddings.service import EmbeddingService
     from backend.ingestion.pipeline.ingest import IngestionPipeline
@@ -53,6 +53,13 @@ async def ingest_directory(directory: str, resume: bool = True):
     embedder = EmbeddingService()
     vr = VectorRetriever()
     await vr.ensure_collection()
+
+    url_manifest = None
+    if url_manifest_path:
+        import json
+        with open(url_manifest_path) as f:
+            url_manifest = json.load(f)
+        logger.info(f"Loaded URL manifest with {len(url_manifest)} entries from {url_manifest_path}")
 
     async with get_db_session() as db:
         pipeline = IngestionPipeline(db=db, embedding_service=embedder, vector_retriever=vr)
@@ -65,11 +72,13 @@ async def ingest_directory(directory: str, resume: bool = True):
             recursive=True,
             resume=resume,
             progress_callback=_progress,
+            url_manifest=url_manifest,
         )
         logger.info(
             f"Ingestion complete: {summary['ingested']} ingested, "
             f"{summary['skipped']} skipped, {len(summary['errors'])} failed, "
-            f"{summary['total_chunks']} total chunks"
+            f"{summary['total_chunks']} total chunks, "
+            f"{summary['documents_without_source_url']} without a source_url"
         )
         if summary["errors"]:
             for e in summary["errors"]:
@@ -83,6 +92,7 @@ def main():
     parser.add_argument("--file", help="Single PDF/TXT path (for --source pdf)")
     parser.add_argument("--dir", help="Directory path (for --source directory)")
     parser.add_argument("--source-url", help="Canonical public URL for the document", default=None)
+    parser.add_argument("--url-manifest", help="Path to a JSON file mapping {filename: source_url} for bulk directory ingestion", default=None)
     parser.add_argument("--no-resume", action="store_true", help="Re-ingest already-indexed files")
     args = parser.parse_args()
 
@@ -93,7 +103,7 @@ def main():
     elif args.source == "directory":
         if not args.dir:
             parser.error("--dir required with --source directory")
-        asyncio.run(ingest_directory(args.dir, resume=not args.no_resume))
+        asyncio.run(ingest_directory(args.dir, resume=not args.no_resume, url_manifest_path=args.url_manifest))
 
 
 if __name__ == "__main__":

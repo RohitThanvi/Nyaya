@@ -19,7 +19,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.config.settings import get_settings
 from backend.models.domain import (
@@ -187,6 +187,10 @@ class HybridRetriever:
         self._reranker = reranker
         self._settings = get_settings().retrieval
 
+    @property
+    def embedder(self) -> EmbeddingService:
+        return self._embedder
+
     def _should_use_vector(
         self, query: str, exact_count: int, bm25_count: int,
         qu: Optional[QueryUnderstanding]
@@ -222,10 +226,28 @@ class HybridRetriever:
         top_k_final: int = 10,
         bm25_weight: Optional[float] = None,
         vector_weight: Optional[float] = None,
+        law_filter: Optional[List] = None,
+        court_filter: Optional[List] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        document_type: Optional[object] = None,
     ) -> Tuple[List[RetrievedChunk], Dict[str, float]]:
         """
         Full retrieval pipeline with timing.
         Returns (reranked_chunks, latency_breakdown_ms).
+
+        BUG FIX: this signature previously had no law_filter/court_filter/
+        year_from/year_to/document_type parameters. retrieve_multi_query()
+        forwards exactly these five names via **filter_kwargs on every call —
+        which is the default path for almost every real query, since
+        QueryUnderstandingAgent populates expanded_queries on nearly all
+        input. That meant every multi-query search raised an unhandled
+        TypeError ("unexpected keyword argument"), with no try/except
+        anywhere in the call chain (run_search → retrieve_multi_query →
+        retrieve), surfacing as a raw 500 on /search and /chat for most
+        real queries. Explicit filter args here (falling back to the
+        query_understanding-derived values) fix the crash AND let
+        API-level filter overrides actually reach retrieval.
         """
         timings: Dict[str, float] = {}
         s = self._settings
@@ -233,10 +255,10 @@ class HybridRetriever:
         vw = vector_weight or s.vector_weight
 
         qu = query_understanding
-        law_filter    = qu.law_filter    if qu else None
-        court_filter  = qu.court_filter  if qu else None
-        year_from     = qu.year_range.get("from") if qu and qu.year_range else None
-        year_to       = qu.year_range.get("to")   if qu and qu.year_range else None
+        law_filter    = law_filter   if law_filter   is not None else (qu.law_filter if qu else None)
+        court_filter  = court_filter if court_filter is not None else (qu.court_filter if qu else None)
+        year_from     = year_from if year_from is not None else (qu.year_range.get("from") if qu and qu.year_range else None)
+        year_to       = year_to   if year_to   is not None else (qu.year_range.get("to")   if qu and qu.year_range else None)
         section_refs  = qu.section_refs  if qu else []
 
         # ── Path 1 + 2: BM25 (includes exact lookup internally) ──────────
@@ -248,6 +270,7 @@ class HybridRetriever:
             court_filter=court_filter,
             year_from=year_from,
             year_to=year_to,
+            document_type=document_type,
             section_refs=section_refs or [],
         )
         timings["bm25_ms"] = (time.perf_counter() - t0) * 1000
@@ -269,6 +292,7 @@ class HybridRetriever:
                 top_k=s.vector_top_k,
                 law_filter=law_filter,
                 court_filter=court_filter,
+                document_type=document_type,
                 year_from=year_from,
                 year_to=year_to,
                 score_threshold=s.min_score_threshold,

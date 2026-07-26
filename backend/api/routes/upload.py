@@ -20,7 +20,7 @@ import os
 import shutil
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -478,7 +478,7 @@ async def document_ingestion_status(
     from sqlalchemy import text as sql_text
 
     doc_row = (await db.execute(
-        sql_text("SELECT document_id, pages FROM documents WHERE document_id = :id"),
+        sql_text("SELECT document_id, pages, indexed_chunk_count FROM documents WHERE document_id = :id"),
         {"id": document_id},
     )).fetchone()
 
@@ -499,25 +499,31 @@ async def document_ingestion_status(
         {"id": document_id},
     )).scalar_one()
 
-    staged_indexed = (await db.execute(
-        sql_text("SELECT COUNT(*) FROM staged_chunks WHERE document_id = :id AND indexed = true"),
-        {"id": document_id},
-    )).scalar_one()
+    # FIX: staged_indexed used to be COUNT(*) FROM staged_chunks WHERE
+    # indexed=true — but flush_staged DELETES rows the moment they're
+    # successfully flushed (see tasks.py), so no row ever sits in
+    # staged_chunks with indexed=true for long, and once a document is
+    # fully done staged_total itself drops to 0. That made "stage" fall
+    # straight back to "embedding" for every successfully completed
+    # document — a permanently stuck progress indicator. indexed_chunk_count
+    # is a persistent counter incremented by flush_staged in the same
+    # transaction as the delete, so it survives past that point.
+    staged_indexed = doc_row.indexed_chunk_count
 
     if chunk_count == 0:
         stage = "parsing"
-    elif staged_total < chunk_count:
-        stage = "embedding"
-    elif staged_indexed < staged_total:
-        stage = "indexing"
-    else:
+    elif staged_indexed >= chunk_count:
         stage = "complete"
+    elif staged_total < chunk_count and staged_indexed == 0:
+        stage = "embedding"
+    else:
+        stage = "indexing"
 
     return {
         "document_id": document_id,
         "pages": doc_row.pages,
         "chunks_parsed": chunk_count,
-        "chunks_embedded": staged_total,
+        "chunks_embedded": staged_total + staged_indexed,
         "chunks_indexed": staged_indexed,
         "stage": stage,
         "complete": stage == "complete",

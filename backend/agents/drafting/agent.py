@@ -387,10 +387,16 @@ RULES:
 4. Never fabricate citations, case names, or section numbers
 5. If context is insufficient, write [ADVOCATE TO VERIFY: {specific item}]
 6. Include all elements needed for the specific document type
+7. MANDATORY: each source in the context below is preceded by a
+   <CHUNK:xxxxxxxx> tag. Immediately after every section number, citation,
+   or specific legal claim in filled_template, insert the matching
+   <CHUNK:xxxxxxxx> tag copied exactly from that source. This is checked
+   mechanically — untagged claims cannot be verified and will be treated
+   as unverified. Example: "...as required under Section 173 BNSS <CHUNK:a1b2c3d4>."
 
 Return valid JSON:
 {
-  "filled_template": "<complete filled document text>",
+  "filled_template": "<complete filled document text, with <CHUNK:xxxxxxxx> tags after every cited claim>",
   "sections_cited": ["BNS 318", "BNSS 173"],
   "key_arguments": ["<argument 1>", "<argument 2>"],
   "drafting_notes": ["<note for advocate 1>"],
@@ -410,14 +416,24 @@ class DraftingAgent:
         return TEMPLATES.get(draft_type, "")
 
     def _build_context(self, chunks: List[RetrievedChunk]) -> str:
-        """Build context from relevant retrieved provisions."""
+        """
+        Build context from relevant retrieved provisions.
+
+        FIX: previously built no <CHUNK:xxxxxxxx> tag at all, unlike every
+        other intent's context (see ContextCompressionAgent). VerificationAgent
+        checks for that tag as its primary, strongest evidence path — without
+        it, every drafted citation fell through to weak fuzzy/DB matching.
+        Uses the same chunk_id[:8] short-id scheme so tags line up with what
+        VerificationAgent expects when given these same retrieved_chunks.
+        """
         parts = []
         for rc in chunks[:6]:
             chunk = rc.chunk
             meta = chunk.metadata
             ref = f"{meta.law.value if meta.law else ''} {chunk.section_ref or ''}".strip()
             citation = meta.citation or ""
-            parts.append(f"[{ref}] [{citation}]\n{chunk.content}")
+            short_id = chunk.chunk_id[:8]
+            parts.append(f"<CHUNK:{short_id}> [{ref}] [{citation}]\n{chunk.content}")
         return "\n\n".join(parts)
 
     async def draft(
