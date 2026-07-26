@@ -132,6 +132,15 @@ class EmbeddingSettings(BaseSettings):
     # fp16 inference: halves VRAM usage, negligible quality difference for
     # retrieval embeddings. Enables larger batches and faster throughput.
     fp16:       bool = Field(default=True)
+    # Bounds concurrent GPU calls from embed_query/embed_batch (the live
+    # API server's on-demand query-embedding path) via an asyncio.Semaphore.
+    # Celery ingestion workers don't need this — each worker process is
+    # already pinned to one GPU and processes tasks serially — but the API
+    # server has no equivalent limit on its own, and run_in_executor's
+    # default thread pool (~min(32, cpu_count+4) threads) would otherwise
+    # let dozens of concurrent user requests dispatch overlapping CUDA
+    # calls onto the same GPU with zero back-pressure.
+    max_concurrent_gpu_calls: int = Field(default=8)
 
 
 class RerankerSettings(BaseSettings):
@@ -144,6 +153,11 @@ class RerankerSettings(BaseSettings):
     batch_size: int  = Field(default=128)   # was 32, GPU handles 128 easily
     cache_dir:  str  = Field(default="./data/embeddings/models")
     fp16:       bool = Field(default=True)
+    # Same rationale as EmbeddingSettings.max_concurrent_gpu_calls — the
+    # reranker runs on every single search/chat request (the hot path),
+    # so it's if anything more exposed to unbounded concurrent GPU calls
+    # from a traffic spike than the embedding service is.
+    max_concurrent_gpu_calls: int = Field(default=8)
 
 
 class RetrievalSettings(BaseSettings):

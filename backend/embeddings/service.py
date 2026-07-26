@@ -43,11 +43,21 @@ class EmbeddingService:
     _model_name: Optional[str] = None
     _verified_dim: Optional[int] = None
     _load_lock = threading.Lock()
+    _gpu_semaphore: Optional[asyncio.Semaphore] = None
 
     def __init__(self):
         self._cfg = get_settings().embedding
         self._expected_dim = get_settings().qdrant.vector_size
         self._redis = None
+
+    @classmethod
+    def _get_gpu_semaphore(cls) -> asyncio.Semaphore:
+        # Created lazily (not at class-definition time) so it's always
+        # bound to whichever event loop is actually running.
+        if cls._gpu_semaphore is None:
+            limit = get_settings().embedding.max_concurrent_gpu_calls
+            cls._gpu_semaphore = asyncio.Semaphore(limit)
+        return cls._gpu_semaphore
 
     @classmethod
     def _load_model_once(cls):
@@ -168,15 +178,16 @@ class EmbeddingService:
 
         model = self._load_model_once()
         loop = asyncio.get_event_loop()
-        embedding = await loop.run_in_executor(
-            None,
-            lambda: model.encode(
-                text,
-                normalize_embeddings=self._cfg.normalize,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-            ).tolist(),
-        )
+        async with self._get_gpu_semaphore():
+            embedding = await loop.run_in_executor(
+                None,
+                lambda: model.encode(
+                    text,
+                    normalize_embeddings=self._cfg.normalize,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                ).tolist(),
+            )
         self._validate_vectors([embedding], "embed_query")
 
         if redis:
@@ -197,16 +208,17 @@ class EmbeddingService:
             return []
         model = self._load_model_once()
         loop = asyncio.get_event_loop()
-        embeddings = await loop.run_in_executor(
-            None,
-            lambda: model.encode(
-                texts,
-                batch_size=self._cfg.batch_size,
-                normalize_embeddings=self._cfg.normalize,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-            ).tolist(),
-        )
+        async with self._get_gpu_semaphore():
+            embeddings = await loop.run_in_executor(
+                None,
+                lambda: model.encode(
+                    texts,
+                    batch_size=self._cfg.batch_size,
+                    normalize_embeddings=self._cfg.normalize,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                ).tolist(),
+            )
         self._validate_vectors(embeddings, "embed_batch")
         return embeddings
 

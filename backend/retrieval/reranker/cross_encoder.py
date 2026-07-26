@@ -32,9 +32,17 @@ class Reranker:
     _model = None
     _loaded = False
     _load_lock = threading.Lock()
+    _gpu_semaphore: Optional[asyncio.Semaphore] = None
 
     def __init__(self):
         self._cfg = get_settings().reranker
+
+    @classmethod
+    def _get_gpu_semaphore(cls) -> asyncio.Semaphore:
+        if cls._gpu_semaphore is None:
+            limit = get_settings().reranker.max_concurrent_gpu_calls
+            cls._gpu_semaphore = asyncio.Semaphore(limit)
+        return cls._gpu_semaphore
 
     @classmethod
     def _load_model_once(cls):
@@ -115,14 +123,15 @@ class Reranker:
             # on a GPU batch. Blocking the asyncio event loop for that long
             # stalls ALL concurrent requests during the reranker pass.
             loop = asyncio.get_event_loop()
-            raw_scores: List[float] = await loop.run_in_executor(
-                None,
-                lambda: model.predict(
-                    pairs,
-                    batch_size=cfg.batch_size,
-                    show_progress_bar=False,
-                ),
-            )
+            async with self._get_gpu_semaphore():
+                raw_scores: List[float] = await loop.run_in_executor(
+                    None,
+                    lambda: model.predict(
+                        pairs,
+                        batch_size=cfg.batch_size,
+                        show_progress_bar=False,
+                    ),
+                )
             logger.debug(
                 f"Reranker: {len(pairs)} pairs in "
                 f"{(time.perf_counter() - t0) * 1000:.0f}ms "
