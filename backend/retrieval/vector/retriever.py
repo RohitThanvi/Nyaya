@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from backend.config.settings import get_settings
 from backend.models.domain import (
-    ChunkType, Citation, DocumentMetadata, DocumentType, LawCategory,
+    ChunkType, Citation, CourtType, DocumentMetadata, DocumentType, LawCategory,
     LegalChunk, RetrievalPath, RetrievedChunk,
 )
 
@@ -124,11 +124,16 @@ class VectorRetriever:
                 law = LawCategory(payload.get("law", "other")) if payload.get("law") else LawCategory.OTHER
             except ValueError:
                 law = LawCategory.OTHER
+            try:
+                court = CourtType(payload["court"]) if payload.get("court") else None
+            except ValueError:
+                court = None
 
             metadata = DocumentMetadata(
                 document_id=payload.get("document_id", ""),
                 document_type=doc_type,
                 law=law,
+                court=court,
                 court_name=payload.get("court_name"),
                 case_number=payload.get("case_number"),
                 citation=payload.get("citation"),

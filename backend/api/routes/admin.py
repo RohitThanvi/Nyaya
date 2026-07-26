@@ -93,18 +93,22 @@ async def rebuild_qdrant_collection(
 
 
 async def _run_rebuild():
-    """Background task: full Qdrant index rebuild from staged_chunks + documents."""
+    """Background task: full Qdrant index rebuild from chunks + documents."""
     from backend.retrieval.vector.retriever import VectorRetriever
+    from backend.embeddings.service import EmbeddingService
     from backend.config.settings import get_settings
     from backend.db.session import get_db_session
+    from qdrant_client.models import PointStruct
     import time
 
     cfg = get_settings().qdrant
     new_name = f"{cfg.collection_name}_rebuild_{int(time.time())}"
     logger.info(f"Zero-downtime rebuild starting: target collection = {new_name}")
 
+    client = None
     try:
         vr = VectorRetriever()
+        embedder = EmbeddingService()
         client = vr._get_client()
 
         # Create new collection with current settings
@@ -128,42 +132,106 @@ async def _run_rebuild():
         )
         logger.info(f"Created new collection: {new_name}")
 
-        # Stream all vectors from staged_chunks into new collection
-        # (staged_chunks has indexed=True rows — they were deleted after flush,
-        # so this needs a full re-embed from the chunks table)
-        # NOTE: Full re-embed from chunks table is expensive — for TB-scale,
-        # this is a background operation that should run during low-traffic hours.
+        # Re-embed every chunk (joined with its document's metadata, same
+        # payload shape used by ingest.py's live path) directly into the
+        # new collection — NOT via upsert_batch, which always writes to
+        # the live alias, not an arbitrary named collection.
+        BATCH = 500
+        offset = 0
+        total_upserted = 0
         async with get_db_session() as db:
             from sqlalchemy import text
             total = (await db.execute(text("SELECT COUNT(*) FROM chunks"))).scalar_one()
             logger.info(f"Rebuild: {total:,} chunks to re-embed")
-            # Dispatch Celery re-embed tasks in batches
-            BATCH = 1000
-            offset = 0
+
             while offset < total:
                 rows = (await db.execute(text("""
-                    SELECT chunk_id FROM chunks
-                    ORDER BY document_id, chunk_index
+                    SELECT c.chunk_id, c.document_id, c.chunk_type, c.content,
+                           c.content_length, c.chunk_index, c.page_number,
+                           c.section_ref, c.subsection_ref,
+                           d.document_type, d.law, d.court, d.court_name,
+                           d.case_number, d.citation, d.year, d.topic,
+                           d.keywords, d.source_url
+                    FROM chunks c
+                    JOIN documents d ON d.document_id = c.document_id
+                    ORDER BY c.document_id, c.chunk_index
                     LIMIT :limit OFFSET :offset
                 """), {"limit": BATCH, "offset": offset})).fetchall()
                 if not rows:
                     break
-                from backend.ingestion.workers.tasks import flush_staged
-                # Mark for re-embedding by resetting staged_chunks entries
-                # This is a simplified trigger — full implementation would
-                # call embed_chunk_batch directly with the target collection
-                offset += BATCH
 
-        # Atomic alias swap
+                texts = [r.content for r in rows]
+                vectors = await embedder.embed_batch(texts)
+
+                points = []
+                for r, vec in zip(rows, vectors):
+                    if not vec or len(vec) != cfg.vector_size:
+                        logger.error(
+                            f"Rebuild: skipping chunk {r.chunk_id} — bad embedding "
+                            f"dimension ({len(vec) if vec else 0}, expected {cfg.vector_size})"
+                        )
+                        continue
+                    points.append(PointStruct(
+                        id=str(r.chunk_id),
+                        vector=vec,
+                        payload={
+                            "chunk_id": str(r.chunk_id),
+                            "document_id": str(r.document_id),
+                            "chunk_type": r.chunk_type,
+                            "content": r.content,
+                            "content_length": r.content_length,
+                            "chunk_index": r.chunk_index,
+                            "page_number": r.page_number,
+                            "section_ref": r.section_ref,
+                            "subsection_ref": r.subsection_ref,
+                            "document_type": r.document_type,
+                            "law": r.law,
+                            "court": r.court,
+                            "court_name": r.court_name,
+                            "case_number": r.case_number,
+                            "citation": r.citation,
+                            "year": r.year,
+                            "topic": r.topic,
+                            "keywords": r.keywords,
+                            "source_url": r.source_url,
+                        },
+                    ))
+
+                if points:
+                    await client.upsert(collection_name=new_name, points=points, wait=False)
+                    total_upserted += len(points)
+
+                offset += BATCH
+                if offset % (BATCH * 20) == 0:
+                    logger.info(f"Rebuild progress: {offset:,}/{total:,} chunks processed")
+
+        # SAFETY CHECK — never swap the live alias onto an incomplete or
+        # empty collection. A rebuild that silently under-populated the
+        # new collection (embedding failures, a crashed batch, etc.) must
+        # not take down production search; abort and clean up instead.
+        new_info = await client.get_collection(new_name)
+        new_count = new_info.points_count or 0
+        logger.info(f"Rebuild: {total_upserted:,} points upserted, "
+                    f"collection reports {new_count:,} of {total:,} expected")
+        if total == 0 or new_count < total * 0.99:
+            raise RuntimeError(
+                f"Rebuild aborted before alias swap — new collection has "
+                f"{new_count:,} points but {total:,} were expected "
+                f"(source chunk count may have changed mid-rebuild, or "
+                f"embedding failures occurred; see errors above)."
+            )
+
+        # Atomic alias swap — only now, with a verified-populated collection.
         await vr.rebuild_collection_alias(new_name)
         logger.info(f"Rebuild complete: alias 'nyaya_active' → '{new_name}'")
 
     except Exception as e:
         logger.error(f"Qdrant rebuild failed: {e}", exc_info=True)
-        try:
-            await client.delete_collection(new_name)
-        except Exception:
-            pass
+        if client is not None:
+            try:
+                await client.delete_collection(new_name)
+            except Exception:
+                pass
 
 
 @router.get("/migrations/status")
