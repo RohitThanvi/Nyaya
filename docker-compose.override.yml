@@ -1,0 +1,29 @@
+# Auto-loaded by `docker compose up`/`docker compose build` with no -f flags
+# (local/dev machines). Production deploys specify explicit files
+# (`-f docker-compose.yml -f docker-compose.gpu.yml -f docker-compose.prod.yml`)
+# and never merge this in.
+#
+# This exists to fix a real, previously-diagnosed-but-never-applied bug:
+# infra/docker/postgres/postgresql.dev.conf was created specifically to
+# replace the production-tuned postgresql.conf (shared_buffers=128GB,
+# effective_cache_size=384GB, etc. — sized for the 512GB production box)
+# for local runs, where a Docker Desktop/WSL2 VM almost never has that
+# much RAM available. Without this override, Postgres kept trying to
+# allocate 128GB of shared_buffers on every start, crash-looping (visible
+# as "database system was not properly shut down; automatic recovery in
+# progress" on EVERY single restart, not just after an unclean stop) —
+# which is what PgBouncer's constant "connect failed" / "client_login_timeout
+# (server down)" errors were actually downstream of: Postgres was down or
+# restarting, not misconfigured on the networking side. The dev.conf file
+# existed in the repo already but nothing ever mounted it, so the bug
+# persisted across every rebuild.
+services:
+  postgres:
+    # Compose replaces the whole volumes list on override rather than
+    # merging entries — repeat every mount from docker-compose.yml's
+    # postgres service, swapping only the config file path.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/docker/postgres/init.sql:/docker-entrypoint-initdb.d/00_extensions.sql
+      - ./backend/db/migrations/0001_initial.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - ./infra/docker/postgres/postgresql.dev.conf:/etc/postgresql/postgresql.conf
