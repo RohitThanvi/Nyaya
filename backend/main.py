@@ -2,7 +2,9 @@
 NyayaAI FastAPI application v2.
 
 Changes from v1:
-- _get_model imported correctly from embeddings.service
+- Embedding model warmup uses the async-safe loader (thread executor) so
+  it no longer blocks the event loop -- and with it /docs and
+  /auth/login|register -- for the entire model load duration
 - SlowAPI rate limits wired per route (not just middleware)
 - AuditLog middleware logs user_id from JWT when present
 - Startup: ensures Qdrant collection exists before accepting traffic
@@ -26,7 +28,7 @@ from sqlalchemy import text
 from backend.api.routes import admin, auth, chat, debug, documents, drafting, health, search, upload
 from backend.config.settings import get_settings
 from backend.db.session import check_db_connection
-from backend.embeddings.service import _get_model
+from backend.embeddings.service import EmbeddingService
 
 logger = logging.getLogger(__name__)
 _cfg = get_settings()
@@ -102,8 +104,17 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Alembic migration warning (non-fatal): {e}")
 
     # ── Warm up embedding model ─────────────────────────────────────────────
+    # Previously called the sync _get_model() directly on the event loop.
+    # SentenceTransformer(...) + a CUDA/CPU warmup forward pass can take
+    # anywhere from several seconds to a couple of minutes (model download
+    # on first run, or plain CPU inference on a laptop) -- and since
+    # lifespan doesn't yield (start actually serving requests) until this
+    # completes, the ENTIRE app was unavailable for that whole duration,
+    # including /docs and /auth/login|register. Using the async-safe
+    # loader (already built for exactly this) runs the blocking load in a
+    # thread executor so the event loop keeps serving other requests.
     try:
-        _get_model()
+        await EmbeddingService._load_model_once_async()
         logger.info("Embedding model warmed up")
     except Exception as e:
         logger.warning(f"Embedding model warmup skipped (non-fatal): {e}")
