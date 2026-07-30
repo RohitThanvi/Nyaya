@@ -53,10 +53,23 @@ async def lifespan(app: FastAPI):
         sql_files = sorted(migrations_dir.glob("*.sql"))
         if sql_files:
             async with async_engine.begin() as conn:
+                # SQLAlchemy's conn.execute(text(sql)) always goes through
+                # asyncpg's extended/prepared-statement protocol, which
+                # rejects multiple commands in a single call ("cannot insert
+                # multiple commands into a prepared statement") -- these
+                # migration files are full multi-statement scripts. Naive
+                # semicolon-splitting isn't safe either: the plpgsql
+                # function bodies below contain their own semicolons inside
+                # $$ ... $$ blocks. Dropping to the raw asyncpg connection
+                # and calling .execute() with no bind params uses the
+                # simple query protocol instead (same as `psql -f`), which
+                # handles multi-statement scripts correctly.
+                raw = await conn.get_raw_connection()
+                asyncpg_conn = raw.driver_connection
                 for sql_path in sql_files:
                     sql = sql_path.read_text()
                     try:
-                        await conn.execute(text(sql))
+                        await asyncpg_conn.execute(sql)
                         logger.info(f"Migration applied: {sql_path.name}")
                     except Exception as e:
                         # Log but continue — most errors are "table already exists"

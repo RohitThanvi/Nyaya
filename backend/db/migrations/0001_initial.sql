@@ -167,14 +167,17 @@ RETURNS TRIGGER AS $$
 BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trg_documents_updated ON documents;
 CREATE TRIGGER trg_documents_updated
     BEFORE UPDATE ON documents
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+DROP TRIGGER IF EXISTS trg_chat_sessions_updated ON chat_sessions;
 CREATE TRIGGER trg_chat_sessions_updated
     BEFORE UPDATE ON chat_sessions
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+DROP TRIGGER IF EXISTS trg_legal_drafts_updated ON legal_drafts;
 CREATE TRIGGER trg_legal_drafts_updated
     BEFORE UPDATE ON legal_drafts
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
