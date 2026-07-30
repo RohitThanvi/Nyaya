@@ -16,8 +16,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0004_staged_chunks_processing_flag"
-down_revision = "0003_partition_chunks_and_indexes"
+revision = "0004_staged_chunks_flag"
+down_revision = "0003_partition_chunks_indexes"
 branch_labels = None
 depends_on = None
 

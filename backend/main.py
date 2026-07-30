@@ -65,6 +65,29 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Schema init warning (non-fatal): {e}")
 
+    # ── Alembic migrations (0002+) ───────────────────────────────────────────
+    # The SQL glob above only ever applies 0001_initial.sql — 0002-0005 are
+    # Python/Alembic revisions and, until this call, alembic upgrade head
+    # was never actually run anywhere (env.py didn't exist at all). That's
+    # why the partitioned chunks table / law column from 0003 never showed
+    # up on any real deployment. Runs synchronously via a thread since
+    # Alembic's own engine handling is sync (psycopg2), not asyncpg.
+    try:
+        import asyncio
+        from alembic import command
+        from alembic.config import Config as AlembicConfig
+        import pathlib as _pathlib
+
+        repo_root = _pathlib.Path(__file__).resolve().parents[1]
+        alembic_cfg = AlembicConfig(str(repo_root / "alembic.ini"))
+        alembic_cfg.set_main_option(
+            "script_location", str(repo_root / "backend" / "db" / "migrations")
+        )
+        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        logger.info("Alembic migrations applied (head)")
+    except Exception as e:
+        logger.warning(f"Alembic migration warning (non-fatal): {e}")
+
     # ── Warm up embedding model ─────────────────────────────────────────────
     try:
         _get_model()

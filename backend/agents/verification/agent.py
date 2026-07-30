@@ -436,6 +436,7 @@ ORIGINAL QUERY: {query}"""
             row = result.fetchone()
         except Exception as e:
             logger.error(f"DB section verify failed: {e}")
+            await self._db.rollback()
             row = None
 
         if row:
@@ -501,6 +502,7 @@ ORIGINAL QUERY: {query}"""
             row = result.fetchone()
         except Exception as e:
             logger.error(f"DB judgment verify failed: {e}")
+            await self._db.rollback()
             row = None
 
         if row:

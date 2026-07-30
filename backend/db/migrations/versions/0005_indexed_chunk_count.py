@@ -24,7 +24,7 @@ import sqlalchemy as sa
 
 
 revision = "0005_indexed_chunk_count"
-down_revision = "0004_staged_chunks_processing_flag"
+down_revision = "0004_staged_chunks_flag"
 branch_labels = None
 depends_on = None
 

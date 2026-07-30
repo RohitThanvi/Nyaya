@@ -221,6 +221,11 @@ class BM25Retriever:
             rows = result.fetchall()
         except Exception as e:
             logger.error(f"Exact section lookup failed: {e}")
+            # Postgres leaves the connection's transaction aborted after any
+            # failed statement — every later query on this same session
+            # (chat_sessions insert, next retrieval tier, etc.) would fail
+            # with "current transaction is aborted" without this rollback.
+            await self._db.rollback()
             return []
 
         retrieved = []
@@ -305,6 +310,12 @@ class BM25Retriever:
             rows = result.fetchall()
         except Exception as e:
             logger.error(f"PG FTS search failed: {e}")
+            # Same reasoning as the exact-section-lookup catch above: without
+            # this, a failed FTS query (e.g. the missing-column bug this was
+            # originally caught by) leaves the session's transaction aborted,
+            # and the very next query in the same request — including an
+            # unrelated chat_sessions insert — fails too.
+            await self._db.rollback()
             return []
 
         retrieved = []

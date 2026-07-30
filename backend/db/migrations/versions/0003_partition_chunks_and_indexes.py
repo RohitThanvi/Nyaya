@@ -67,8 +67,16 @@ def upgrade() -> None:
         count = conn.execute(sa.text("SELECT COUNT(*) FROM chunks")).scalar()
         has_data = count > 0
 
-        if has_data:
-            conn.execute(sa.text("ALTER TABLE chunks RENAME TO chunks_old"))
+        # Rename the existing table out of the way whenever it exists and
+        # isn't already partitioned -- regardless of whether it has data.
+        # Previously this only ran when has_data was true, so a freshly
+        # initialized (empty) chunks table was left in place, the
+        # subsequent `CREATE TABLE IF NOT EXISTS chunks (...) PARTITION BY`
+        # silently no-opped (a table named chunks already existed), and
+        # every `CREATE TABLE ... PARTITION OF chunks` after it failed with
+        # `"chunks" is not partitioned` -- reproduced and confirmed against
+        # a real Postgres instance.
+        conn.execute(sa.text("ALTER TABLE chunks RENAME TO chunks_old"))
 
     if not is_partitioned:
         # Create the partitioned parent table
@@ -151,6 +159,10 @@ def upgrade() -> None:
             """))
             # Keep chunks_old until manually verified, then drop:
             # DROP TABLE chunks_old;
+        else:
+            # Nothing to migrate — chunks_old is just the empty pre-partition
+            # table renamed out of the way above, safe to drop immediately.
+            conn.execute(sa.text("DROP TABLE IF EXISTS chunks_old"))
 
     # Always ensure these indexes exist (idempotent on re-run)
     conn.execute(sa.text("""
