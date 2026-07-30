@@ -104,6 +104,32 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
   timestamp?: string
+  // Present on assistant messages loaded from history / streamed responses
+  citations?: Citation[]
+  confidence?: number
+  warnings?: string[]
+  hallucination_flags?: string[]
+}
+
+// Matches GET /chat/sessions row shape
+export interface ChatSessionSummary {
+  session_id: string
+  title: string
+  created_at: string | null
+  updated_at: string | null
+}
+
+// Matches GET /chat/sessions/{id}/messages row shape
+export interface ChatSessionMessage {
+  message_id: string
+  role: 'user' | 'assistant' | 'system'
+  content: string
+  citations: Citation[]
+  hallucination_flags: string[]
+  confidence: number | null
+  intent: string | null
+  latency_ms: number | null
+  created_at: string | null
 }
 
 export interface ChatRequest {

@@ -5,6 +5,7 @@ import { useSearchParams } from 'next/navigation'
 import { Send, MessageSquare, Scale, AlertTriangle, CheckCircle2, ChevronDown, Trash2, BookOpen, FileText, X } from 'lucide-react'
 import { chatApi } from '@/lib/api'
 import { useChatStore } from '@/lib/store'
+import { ChatHistorySidebar } from '@/components/chat/ChatHistorySidebar'
 import type { LawCategory } from '@/types/api'
 import { toast } from 'sonner'
 import ReactMarkdown from 'react-markdown'
@@ -64,7 +65,7 @@ function ChatContent() {
 
   const { messages, sessionId, isStreaming, streamingContent,
     addMessage, setStreaming, appendStreamToken, commitStreamedMessage,
-    clearSession } = useChatStore()
+    startNewChat, loadSessions } = useChatStore()
 
   const [input, setInput] = useState('')
   const [lawFilter, setLawFilter] = useState<LawCategory[]>([])
@@ -114,9 +115,12 @@ function ChatContent() {
         stream: true,
       },
       (token) => appendStreamToken(token),
-      () => {
-        commitStreamedMessage()
+      (response) => {
+        commitStreamedMessage(response)
         setStreaming(false)
+        // Refresh the history sidebar so a new/updated session shows up
+        // with its latest title and timestamp.
+        loadSessions()
       },
       (err) => {
         // Don't commit a partial/error stream as a message — just reset state
@@ -126,7 +130,7 @@ function ChatContent() {
       }
     )
   }, [input, isStreaming, messages, sessionId, lawFilter, documentId,
-    addMessage, setStreaming, appendStreamToken, commitStreamedMessage])
+    addMessage, setStreaming, appendStreamToken, commitStreamedMessage, loadSessions])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
@@ -152,7 +156,9 @@ function ChatContent() {
   ]
 
   return (
-    <div className="flex flex-col h-screen bg-background">
+    <div className="flex h-screen bg-background">
+      <ChatHistorySidebar />
+      <div className="flex flex-col flex-1 min-w-0 relative">
       {/* Header */}
       <header className="shrink-0 border-b border-border bg-card/50 backdrop-blur-sm px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-3">
@@ -179,7 +185,7 @@ function ChatContent() {
             ))}
           </div>
           {messages.length > 0 && (
-            <button onClick={clearSession}
+            <button onClick={startNewChat}
               className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors">
               <Trash2 className="w-3.5 h-3.5" />Clear
             </button>
@@ -276,6 +282,7 @@ function ChatContent() {
             Answers are grounded in retrieved legal text. Not legal advice — consult an advocate.
           </p>
         </div>
+      </div>
       </div>
     </div>
   )

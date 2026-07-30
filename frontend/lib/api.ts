@@ -11,8 +11,9 @@
 import axios, { AxiosInstance } from 'axios'
 import Cookies from 'js-cookie'
 import type {
-  ChatRequest, DocumentListParams, DraftRequest, DraftResponse, JudgmentSummary,
-  LegalResponse, PaginatedDocuments, SearchRequest, TokenResponse, UploadResponse, User
+  ChatRequest, ChatSessionMessage, ChatSessionSummary, DocumentListParams, DraftRequest,
+  DraftResponse, JudgmentSummary, LegalResponse, PaginatedDocuments, SearchRequest,
+  TokenResponse, UploadResponse, User
 } from '@/types/api'
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
@@ -207,7 +208,10 @@ export const chatApi = {
   async streamChat(
     request: ChatRequest,
     onToken: (token: string) => void,
-    onDone: (citations?: unknown[]) => void,
+    // FIX: backend sends {done: true, response: LegalResponse} on completion,
+    // never a top-level `citations` key — onDone previously always received
+    // `undefined`, so confidence/citations/warnings never reached the UI.
+    onDone: (response?: LegalResponse) => void,
     onError: (err: string) => void,
   ): Promise<void> {
     const token = Cookies.get('access_token')
@@ -249,7 +253,7 @@ export const chatApi = {
         try {
           const parsed = JSON.parse(raw)
           if (parsed.done) {
-            onDone(parsed.citations)
+            onDone(parsed.response)
             return
           }
           if (parsed.error) {
@@ -268,13 +272,13 @@ export const chatApi = {
     onDone()
   },
 
-  async getSessions() {
-    const res = await api.get('/chat/sessions')
+  async getSessions(): Promise<ChatSessionSummary[]> {
+    const res = await api.get<ChatSessionSummary[]>('/chat/sessions')
     return res.data
   },
 
-  async getSessionMessages(sessionId: string) {
-    const res = await api.get(`/chat/sessions/${sessionId}/messages`)
+  async getSessionMessages(sessionId: string): Promise<ChatSessionMessage[]> {
+    const res = await api.get<ChatSessionMessage[]>(`/chat/sessions/${sessionId}/messages`)
     return res.data
   },
 
