@@ -98,8 +98,18 @@ async def lifespan(app: FastAPI):
         alembic_cfg.set_main_option(
             "script_location", str(repo_root / "backend" / "db" / "migrations")
         )
-        await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+        await asyncio.wait_for(
+            asyncio.to_thread(command.upgrade, alembic_cfg, "head"),
+            timeout=60,
+        )
         logger.info("Alembic migrations applied (head)")
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Alembic migration timed out after 60s (non-fatal) — app will "
+            "still start, but the DB schema may be out of date. Check DB "
+            "connectivity/locks and consider running `alembic upgrade head` "
+            "manually."
+        )
     except Exception as e:
         logger.warning(f"Alembic migration warning (non-fatal): {e}")
 

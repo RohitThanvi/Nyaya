@@ -45,10 +45,19 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    # Without an explicit connect_timeout, a psycopg2 connection attempt
+    # that can't complete quickly (network hiccup, pgbouncer not fully
+    # warm yet, DNS taking a moment on a new host, etc.) hangs
+    # indefinitely rather than failing. Since main.py awaits this whole
+    # step (via asyncio.to_thread) before yielding -- i.e. before the app
+    # starts accepting ANY requests -- an indefinite hang here freezes
+    # the entire app, not just this migration step. Failing fast lets
+    # main.py's surrounding try/except log it and continue startup.
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"connect_timeout": 10},
     )
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
